@@ -83,8 +83,13 @@ Prefixo comum: `seguranca/patrimonio/meu-esp32`
 Payload de `.../state` (campo opcional `schedule`):
 
 ```json
-{ "armed": true, "alarm": false, "schedule": "active" }
+{ "armed": true, "alarm": false, "schedule": "active", "ntp": true }
 ```
+
+| Campo | Tipo | Significado |
+|-------|------|-------------|
+| `schedule` | string | `idle` \| `active` \| `override` (janela de agendamento) |
+| `ntp` | boolean | `true` = NTP/relógio civil ok; `false` = aguardando NTP |
 
 | Valor de `schedule` | Significado |
 |---------------------|-------------|
@@ -121,6 +126,7 @@ Payload de `.../state` (campo opcional `schedule`):
 | `schedule_skipped` | Início da janela com override manual (não rearmou) |
 | `schedule_invalid` | Payload/horário inválido em `.../schedule` |
 | `schedule_time_missing` | NTP ainda não sincronizado (não transiciona) |
+| `ntp_synced` | Relógio civil do ESP32 passou a ser válido (NTP) |
 
 ---
 
@@ -202,8 +208,28 @@ Regras:
 2. **Override manual**: desarmar **dentro** da janela impede o rearme automático até o **fim** dessa janela.
 3. Armar manualmente limpa o hold; salvar uma nova configuração também religa o agendamento.
 4. Sem NTP (rede/servidor de tempo), o firmware publica `schedule_time_missing` e **não** transiciona.
-5. Fuso fixo no firmware: **UTC-3** (America/Sao_Paulo, sem DST). Ajuste `NTP_GMT_OFFSET_SEC` se necessário.
-6. Para testar rápido no Wokwi: salve uma janela de 2–3 minutos a partir do horário atual.
+5. O card mostra **`NTP: sincronizado`** ou **`NTP: aguardando relógio`** (campo `ntp` em `.../state`).
+6. Fuso fixo no firmware: **UTC-3** (America/Sao_Paulo, sem DST). Ajuste `NTP_GMT_OFFSET_SEC` se necessário.
+7. Para testar rápido no Wokwi: salve uma janela de 2–3 minutos a partir do horário atual **e** aguarde o NTP sincronizar.
+8. Salvar **depois** que a janela já começou (ex.: 18:05 com início 18:00) **deve armar na hora** — o ESP32 reavalia ao receber o tópico.
+9. O painel publica `.../schedule` com **retain**: se o ESP32 estava offline, a config chega no reconnect (mas o **NTP** ainda precisa valer para transicionar).
+
+### Se às 18:00 não armou (checklist)
+
+| Verificar | O que fazer |
+|-----------|-------------|
+| Serial `[NTP] Relógio civil sincronizado` | Se não aparecer em ~30–60 s, NTP bloqueado (comum no Wokwi) |
+| Painel `NTP: sincronizado` | Se “aguardando”, **não** arma |
+| Serial `[SCHED] RX raw … enabled` | Confira se o payload traz `"enabled": true` |
+| Serial `[SCHED] saved 18:00-… en=1` | Se `en=0`, o agendamento está **desligado** — marque “Agendamento ativo” e salve |
+| Serial `[SCHED] now=… win=18:00-08:00 en=1 inside=1` | Debug a cada ~5 s no Serial |
+| Serial `[SCHED] ARM (agendamento)` | Borda/apply funcionando |
+| Flood de `[MQTT] RX …/schedule` + `en=0` | Outro cliente no broker público (aba extra, MQTT Explorer, 2ª simulação) republicando o mesmo prefixo |
+| Sem `[SCHED] ARM` com `inside=1 state=0 hold=0` | Bug — cole o Serial aqui |
+
+**`en=0` no Serial:** o circuito **não** vai transicionar. Abra **um** só painel, marque *Agendamento ativo*, salve e veja `en=1`. Se o flood continuar, troque `SECURITY_TOPIC_PREFIX` / `MQTT_TOPIC_BASE` para um prefixo único (o broker HiveMQ é público).
+
+No Wokwi, se o NTP nunca subir, o agendamento **não** funciona por horário civil — use armamento manual ou simule com janela curta em hardware real / rede que liberar UDP 123.
 
 ---
 

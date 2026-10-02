@@ -86,6 +86,8 @@ SystemState g_state = STATE_DISARMED;
 ScheduleConfig g_schedule;
 bool g_scheduleManualHold = false;
 bool g_scheduleWasInside  = false;
+bool g_timeSynced         = false;
+uint32_t g_lastSchedDebugMs = 0;
 
 int      g_distance = 200;
 bool     g_pir      = false;
@@ -159,7 +161,7 @@ void publishLog(const char* event) {
 }
 
 void publishState() {
-  StaticJsonDocument<160> doc;
+  StaticJsonDocument<192> doc;
   doc["armed"] = (g_state != STATE_DISARMED);
   doc["alarm"] = (g_state == STATE_ALARM);
 
@@ -167,13 +169,14 @@ void publishState() {
   bool hasTime = getLocalTime(&timeinfo, 0);
   const char* schedLabel = scheduleLabel(g_schedule, hasTime ? &timeinfo : nullptr, hasTime);
   doc["schedule"] = schedLabel;
+  doc["ntp"] = hasTime;
 
-  char buf[160];
+  char buf[192];
   serializeJson(doc, buf, sizeof(buf));
   mqttClient.publish(TOPIC_STATE, buf);
-  Serial.printf("[STATE] armed=%d alarm=%d schedule=%s\n",
+  Serial.printf("[STATE] armed=%d alarm=%d schedule=%s ntp=%d\n",
                 g_state != STATE_DISARMED, g_state == STATE_ALARM,
-                schedLabel);
+                schedLabel, hasTime);
 }
 
 void publishAlarm(const char* type, uint16_t value) {
@@ -257,12 +260,22 @@ void markManualHoldIfInWindow() {
   }
 }
 
-// Borda de janela via NTP (chamado no loop).
+// Borda de janela via NTP (chamado no loop e após salvar config).
 void evaluateSchedule() {
   struct tm timeinfo;
   bool hasTime = getLocalTime(&timeinfo, 0);
-  bool inside = false;
 
+  // Publica estado quando o NTP passa a responder (indicador no painel).
+  if (hasTime && !g_timeSynced) {
+    g_timeSynced = true;
+    g_scheduleWasInside = false;  // força reavaliar a janela com hora válida
+    publishState();
+    publishLog("ntp_synced");
+    Serial.printf("[NTP] Relógio civil sincronizado: %02d:%02d:%02d (wday=%d)\n",
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_wday);
+  }
+
+  bool inside = false;
   if (g_schedule.enabled && hasTime) {
     inside = isScheduleWindowActive(g_schedule, timeinfo);
   }
@@ -270,7 +283,7 @@ void evaluateSchedule() {
   if (inside && !g_scheduleWasInside) {
     if (g_scheduleManualHold) {
       publishLog("schedule_skipped");
-      Serial.println("[SCHED] início com hold manual — não rearmou");
+      Serial.println("[SCHED] hold manual — não rearmou");
     } else if (g_state == STATE_DISARMED) {
       setState(STATE_ARMED, "schedule_armed");
       beep(1200, 120);
@@ -289,6 +302,18 @@ void evaluateSchedule() {
     } else {
       publishState();
     }
+  }
+
+  // Debug periódico no Serial
+  if (hasTime && (millis() / 5000) != (g_lastSchedDebugMs / 5000)) {
+    g_lastSchedDebugMs = millis();
+    char armBuf[8], disarmBuf[8], nowBuf[8];
+    formatHourMinute(g_schedule.armMinutes, armBuf, sizeof(armBuf));
+    formatHourMinute(g_schedule.disarmMinutes, disarmBuf, sizeof(disarmBuf));
+    formatHourMinute((uint16_t)(timeinfo.tm_hour * 60 + timeinfo.tm_min), nowBuf, sizeof(nowBuf));
+    Serial.printf("[SCHED] now=%s win=%s-%s en=%d wd=%d inside=%d hold=%d state=%d\n",
+                  nowBuf, armBuf, disarmBuf, g_schedule.enabled, g_schedule.weekdaysOnly,
+                  inside, g_scheduleManualHold, (int)g_state);
   }
 
   g_scheduleWasInside = inside;
@@ -363,6 +388,13 @@ void handleCommand(const char* action) {
 }
 
 void handleScheduleConfigMessage(const uint8_t* payload, unsigned int length) {
+  // Payload bruto ajuda a achar quem publica en=0 no broker público.
+  char raw[96];
+  size_t n = length < sizeof(raw) - 1 ? length : sizeof(raw) - 1;
+  memcpy(raw, payload, n);
+  raw[n] = '\0';
+  Serial.printf("[SCHED] RX raw (%u): %s\n", length, raw);
+
   StaticJsonDocument<256> doc;
   if (deserializeJson(doc, payload, length)) {
     Serial.println("[SCHED] JSON inválido");
@@ -389,10 +421,21 @@ void handleScheduleConfigMessage(const uint8_t* payload, unsigned int length) {
       g_schedule.disarmMinutes != next.disarmMinutes ||
       g_schedule.weekdaysOnly != next.weekdaysOnly;
 
+  // Config idêntica: não regrava nem re-broadcasta (evita loop se outro
+  // cliente/simulação republicar o mesmo retained no prefixo público).
+  if (!configChanged) {
+    Serial.println("[SCHED] config igual — ignorado (sem republicar)");
+    return;
+  }
+
   g_schedule = next;
   if (!next.enabled || configChanged) {
     g_scheduleManualHold = false;
   }
+
+  // Reavaliar já: save "tarde" (janela já começou) deve armar na hora.
+  g_scheduleWasInside = false;
+  evaluateSchedule();
 
   char armBuf[8];
   char disarmBuf[8];
@@ -443,8 +486,10 @@ void setupWiFi() {
                 WiFi.localIP().toString().c_str());
 
   if (WiFi.status() == WL_CONNECTED) {
+    setenv("TZ", "BRT3", 1);
+    tzset();
     configTime(NTP_GMT_OFFSET_SEC, 0, NTP_SERVER_1, NTP_SERVER_2);
-    Serial.println("[NTP] configTime solicitado");
+    Serial.println("[NTP] configTime solicitado (TZ BRT3)");
   }
 }
 

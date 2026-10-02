@@ -64,6 +64,9 @@ const SCHEDULE_STATE_OVERRIDE = 'override';
 // HH:MM 24h — mesmo formato usado no firmware (parseHourMinute).
 const SCHEDULE_TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+// Último estado de NTP recebido em .../state (null = ainda não informado).
+let lastNtpSynced = null;
+
 /* =========================================================
    2. Referências ao DOM
    ========================================================= */
@@ -213,17 +216,36 @@ function fillScheduleForm(config) {
 }
 
 /**
+ * Descreve o estado do NTP do ESP32 para o painel.
+ * @param {boolean|null} ntpSynced
+ * @returns {string}
+ */
+function describeNtpStatus(ntpSynced) {
+  if (ntpSynced === true) return 'NTP: sincronizado';
+  if (ntpSynced === false) return 'NTP: aguardando relógio';
+  return 'NTP: —';
+}
+
+/**
  * Atualiza o status textual do card de agendamento.
  * @param {{enabled?: boolean, armAt?: string, disarmAt?: string, weekdaysOnly?: boolean}} config
  * @param {string} [scheduleField] campo opcional do tópico de estado
  * @param {'ok'|'warn'|'error'|''} [tone]
+ * @param {boolean|null} [ntpSynced]
  */
-function renderScheduleStatus(config, scheduleField = '', tone = 'ok') {
+function renderScheduleStatus(config, scheduleField = '', tone = 'ok', ntpSynced = lastNtpSynced) {
   const summary = formatScheduleSummary(config);
   let text = summary;
 
   if (scheduleField) {
     text += ` · Status atual: ${describeScheduleField(scheduleField)}`;
+  }
+
+  text += ` · ${describeNtpStatus(ntpSynced)}`;
+
+  // Sem NTP, o agendamento não transiciona — destaque em âmbar.
+  if (ntpSynced === false && config.enabled) {
+    tone = 'warn';
   }
 
   scheduleStatusElement.textContent = text;
@@ -392,6 +414,7 @@ function publishCommand(action) {
 
 /**
  * Publica a configuração de agendamento no tópico .../schedule.
+ * retain: true — se o ESP32 estiver offline, o broker guarda e entrega no reconnect.
  * O ESP32 persiste em NVS e re-broadcasta o payload (retained).
  * @param {{enabled: boolean, armAt: string, disarmAt: string, weekdaysOnly: boolean}} config
  */
@@ -404,8 +427,9 @@ function publishSchedule(config) {
   }
 
   const payload = buildSchedulePayload(config);
-  mqttClient.publish(MQTT_TOPIC_SCHEDULE, JSON.stringify(payload), { qos: 0 });
-  renderScheduleStatus(payload, '', 'ok');
+  mqttClient.publish(MQTT_TOPIC_SCHEDULE, JSON.stringify(payload), { qos: 0, retain: true });
+  const tone = lastNtpSynced === false && payload.enabled ? 'warn' : 'ok';
+  renderScheduleStatus(payload, '', tone, lastNtpSynced);
   appendLogEntry(
     `→ agendamento: ${payload.armAt}–${payload.disarmAt}${payload.enabled ? '' : ' (inativo)'}`,
     'arm'
@@ -420,10 +444,15 @@ function handleStateMessage(rawPayload) {
   const data = JSON.parse(rawPayload);
   renderSystemState(data.armed, data.alarm);
 
+  if (typeof data.ntp === 'boolean') {
+    lastNtpSynced = data.ntp;
+  }
+
   // Complementa o card de agendamento se o firmware publicar o campo schedule.
   if (typeof data.schedule === 'string') {
     const form = readScheduleForm();
-    renderScheduleStatus(form, data.schedule, 'ok');
+    const tone = lastNtpSynced === false && form.enabled ? 'warn' : 'ok';
+    renderScheduleStatus(form, data.schedule, tone, lastNtpSynced);
   }
 }
 
@@ -479,7 +508,8 @@ function handleStatusMessage(rawPayload) {
 function handleScheduleMessage(rawPayload) {
   const data = JSON.parse(rawPayload);
   fillScheduleForm(data);
-  renderScheduleStatus(data, '', 'ok');
+  const tone = lastNtpSynced === false && data.enabled ? 'warn' : 'ok';
+  renderScheduleStatus(data, '', tone, lastNtpSynced);
 }
 
 /**
@@ -585,7 +615,7 @@ function wireScheduleForm() {
     const config = readScheduleForm();
 
     if (!isValidTimeString(config.armAt) || !isValidTimeString(config.disarmAt)) {
-      renderScheduleStatus(config, '', 'error');
+      renderScheduleStatus(config, '', 'error', lastNtpSynced);
       scheduleStatusElement.textContent =
         'Horários inválidos — use o formato HH:MM (00:00–23:59).';
       return;
@@ -602,7 +632,7 @@ function initializeDashboard() {
   renderSystemState(false, false);
   wireControlButtons();
   wireScheduleForm();
-  renderScheduleStatus(readScheduleForm(), '', 'ok');
+  renderScheduleStatus(readScheduleForm(), '', 'ok', lastNtpSynced);
   connectMqttClient();
 }
 
