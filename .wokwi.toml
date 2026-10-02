@@ -1,0 +1,7 @@
+# Configuração do projeto Wokwi — firmware de PRODUÇÃO
+# Abrir a pasta raiz do projeto no Wokwi (online ou VS Code + extensão).
+# O circuito completo está em diagram.toml (OLED, PIR, HC-SR04, LDR, buzzers…).
+
+[wokwi]
+version = 1
+firmware = "sketch.ino"

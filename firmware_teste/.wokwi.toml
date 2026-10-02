@@ -1,0 +1,7 @@
+# Configuração do projeto Wokwi — firmware de teste do painel
+# Abrir a pasta firmware_teste/ no Wokwi (online ou VS Code + extensão).
+# O circuito (botão, LED, resistor) está em diagram.toml.
+
+[wokwi]
+version = 1
+firmware = "firmware_teste.ino"

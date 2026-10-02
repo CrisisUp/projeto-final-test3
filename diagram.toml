@@ -1,0 +1,188 @@
+# Circuito Wokwi — firmware de PRODUÇÃO (sketch.ino)
+#
+# Pinout espelhado de sketch.ino:
+#   PIR          OUT  → GPIO 16
+#   HC-SR04      TRIG → GPIO 5   |  ECHO → GPIO 18
+#   LDR (div.)   ADC  → GPIO 34
+#   Buzzer 1              GPIO 19
+#   Buzzer 2              GPIO 23
+#   Botão        (pull-up) GPIO 4 → GND
+#   LED          GPIO 2 → 220Ω → LED → GND
+#   OLED SSD1306 I2C  SDA → GPIO 21  |  SCL → GPIO 22  (addr 0x3C)
+#
+# Rede: Wokwi-GUEST | Broker: broker.hivemq.com:1883
+
+[[board]]
+type = "wokwi:esp32-devkit-v1"
+
+# ─── OLED SSD1306 (I2C) ───
+[[part]]
+type = "wokwi:oled-ssd1306"
+id = "oled1"
+label = "OLED"
+
+# ─── PIR (movimento) ───
+[[part]]
+type = "wokwi:pir"
+id = "pir1"
+label = "PIR"
+
+# ─── HC-SR04 (ultrassônico) ───
+[[part]]
+type = "wokwi:hcsr04"
+id = "ultra1"
+label = "HC-SR04"
+
+# ─── LDR + resistor (divisor em GPIO 34) ───
+[[part]]
+type = "wokwi:photoresistor"
+id = "ldr1"
+label = "LDR"
+
+[[part]]
+type = "wokwi:resistor"
+id = "rldr"
+value = "10k"
+label = "10k"
+
+# ─── Buzzers ───
+[[part]]
+type = "wokwi:buzzer"
+id = "bz1"
+label = "BUZ1"
+
+[[part]]
+type = "wokwi:buzzer"
+id = "bz2"
+label = "BUZ2"
+
+# ─── Botão + LED de status ───
+[[part]]
+type = "wokwi:button"
+id = "btn1"
+label = "ARM"
+
+[[part]]
+type = "wokwi:resistor"
+id = "rled"
+value = "220"
+
+[[part]]
+type = "wokwi:led"
+id = "led1"
+color = "red"
+label = "STATUS"
+
+# =========================================================
+# Conexões — OLED I2C
+# =========================================================
+[[connection]]
+from = "board:3V3"
+to = "oled1:VCC"
+
+[[connection]]
+from = "board:GND"
+to = "oled1:GND"
+
+[[connection]]
+from = "board:GPIO21"
+to = "oled1:SDA"
+
+[[connection]]
+from = "board:GPIO22"
+to = "oled1:SCL"
+
+# =========================================================
+# Conexões — PIR
+# =========================================================
+[[connection]]
+from = "board:5V"
+to = "pir1:VCC"
+
+[[connection]]
+from = "board:GND"
+to = "pir1:GND"
+
+[[connection]]
+from = "board:GPIO16"
+to = "pir1:OUT"
+
+# =========================================================
+# Conexões — HC-SR04
+# =========================================================
+[[connection]]
+from = "board:5V"
+to = "ultra1:VCC"
+
+[[connection]]
+from = "board:GND"
+to = "ultra1:GND"
+
+[[connection]]
+from = "board:GPIO5"
+to = "ultra1:TRIG"
+
+[[connection]]
+from = "board:GPIO18"
+to = "ultra1:ECHO"
+
+# =========================================================
+# Conexões — LDR (divisor: 3V3 — LDR — GPIO34 — 10k — GND)
+# =========================================================
+[[connection]]
+from = "board:3V3"
+to = "ldr1:1"
+
+[[connection]]
+from = "ldr1:2"
+to = "board:GPIO34"
+
+[[connection]]
+from = "board:GPIO34"
+to = "rldr:1"
+
+[[connection]]
+from = "rldr:2"
+to = "board:GND"
+
+# =========================================================
+# Conexões — Buzzers (LEDC nos pinos do firmware)
+# =========================================================
+[[connection]]
+from = "board:GPIO19"
+to = "bz1:A"
+
+[[connection]]
+from = "bz1:K"
+to = "board:GND"
+
+[[connection]]
+from = "board:GPIO23"
+to = "bz2:A"
+
+[[connection]]
+from = "bz2:K"
+to = "board:GND"
+
+# =========================================================
+# Conexões — Botão (GPIO4, INPUT_PULLUP) e LED (GPIO2)
+# =========================================================
+[[connection]]
+from = "board:GPIO4"
+to = "btn1:1.l"
+
+[[connection]]
+from = "btn1:2.r"
+to = "board:GND"
+
+[[connection]]
+from = "board:GPIO2"
+to = "rled:1"
+
+[[connection]]
+from = "rled:2"
+to = "led1:A"
+
+[[connection]]
+from = "led1:C"
+to = "board:GND"

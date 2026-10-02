@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Segurança Patrimonial</title>
+  <link rel="stylesheet" href="styles.css">
+  <!-- MQTT.js é carregado antes de app.js: o dashboard depende do global `mqtt`. -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+</head>
+<body>
+  <div class="container">
+
+    <!-- Cabeçalho: título + indicador de conexão MQTT -->
+    <header>
+      <h1>🛡️ Segurança Patrimonial v2</h1>
+      <div class="connection-badge">
+        <div class="dot" id="connDot"></div>
+        <span id="connLabel">Conectando…</span>
+      </div>
+    </header>
+
+    <!-- Card de estado: DESARMADO / ARMADO / INVASÃO -->
+    <div class="state-card card disarmed" id="stateCard">
+      <div class="state-icon" id="stateIcon">🔓</div>
+      <div class="state-title" id="stateTitle">DESARMADO</div>
+      <div class="state-sub" id="stateSub">Sistema inativo</div>
+    </div>
+
+    <!-- Métricas em tempo real -->
+    <div class="grid grid-4" style="margin-top:16px">
+      <div class="card">
+        <div class="metric-label">Distância</div>
+        <div class="metric-value" id="mDist">--</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">PIR</div>
+        <div class="metric-value muted" id="mPir">--</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Luz (LDR)</div>
+        <div class="metric-value" id="mLdr">--</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">ESP32</div>
+        <div class="metric-value muted" id="mEsp">--</div>
+      </div>
+    </div>
+
+    <!-- Controles: comandos enviados via MQTT -->
+    <div class="card" style="margin-top:16px">
+      <div class="metric-label" style="margin-bottom:12px">Controles</div>
+      <div class="btn-grid">
+        <button class="btn-arm"    id="btnArm">🔒 Armar</button>
+        <button class="btn-disarm" id="btnDisarm">🔓 Desarmar</button>
+        <button class="btn-reset"  id="btnReset"  disabled>🔕 Silenciar Alarme</button>
+        <button class="btn-test"   id="btnTest">🔊 Testar Sirene</button>
+        <button class="btn-recal full" id="btnRecal">🌗 Recalibrar LDR</button>
+      </div>
+    </div>
+
+    <!-- Histórico de eventos do sistema -->
+    <div class="card" style="margin-top:16px">
+      <div class="metric-label" style="margin-bottom:12px">Histórico de Eventos</div>
+      <div class="log" id="log"></div>
+    </div>
+
+    <footer>
+      Broker público — use tópico único · ESP32 + MQTT + LDR
+    </footer>
+  </div>
+
+  <!-- app.js por último: usa os IDs acima e o global `mqtt` -->
+  <script src="app.js"></script>
+</body>
+</html>

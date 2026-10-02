@@ -1,0 +1,48 @@
+# Circuito Wokwi — firmware de teste (painel web)
+#
+# ESP32 DevKit V1
+#   GPIO 4  → botão (INPUT_PULLUP) → GND
+#   GPIO 2  → resistor 220Ω → LED (ânode) ; LED (cátodo) → GND
+#
+# Compatible with sketch: firmware_teste.ino
+
+[[board]]
+type = "wokwi:esp32-devkit-v1"
+
+[[part]]
+type = "wokwi:button"
+id = "btn1"
+label = "ARM / ALARM"
+
+[[part]]
+type = "wokwi:resistor"
+id = "r1"
+value = "220"
+
+[[part]]
+type = "wokwi:led"
+id = "led1"
+color = "red"
+label = "STATUS"
+
+# Botão: GPIO4 → botão → GND (pull-up interno no ESP32)
+[[connection]]
+from = "board:GPIO4"
+to = "btn1:1.l"
+
+[[connection]]
+from = "btn1:2.r"
+to = "board:GND"
+
+# LED: GPIO2 → 220Ω → ânode ; cátodo → GND
+[[connection]]
+from = "board:GPIO2"
+to = "r1:1"
+
+[[connection]]
+from = "r1:2"
+to = "led1:A"
+
+[[connection]]
+from = "led1:C"
+to = "board:GND"

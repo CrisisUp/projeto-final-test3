@@ -1,0 +1,29 @@
+# Artefatos de build / IDE local
+build/
+*.o
+*.elf
+*.bin
+*.map
+
+# C/C++ Runner (gcc desktop) — não é o toolchain do ESP32
+.vscode/
+*.code-workspace
+
+# Arduino / PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+*.pyc
+__pycache__/
+
+# Sistema / editores
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+
+# Segredos locais (se algum dia houver)
+.env
+*.local
+secrets.h

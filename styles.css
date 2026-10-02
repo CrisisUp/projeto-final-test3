@@ -1,0 +1,290 @@
+/*
+ * styles.css — Segurança Patrimonial (Dashboard Web)
+ *
+ * Papel: apresentação visual do painel. Não contém lógica de negócio.
+ * Cores, limiares visuais e classes de estado espelham o contrato com o
+ * JavaScript (app.js): disarmed / armed / alarm, e classes de métrica.
+ */
+
+/* =========================================================
+   1. Variáveis de tema
+   ========================================================= */
+:root {
+  --bg: #0a0c10;
+  --card: #141821;
+  --border: #1f2530;
+  --text: #e8ecf3;
+  --muted: #7a8497;
+  --green: #22c55e;
+  --red: #ef4444;
+  --blue: #3b82f6;
+  --amber: #f59e0b;
+  --purple: #8b5cf6;
+}
+
+/* =========================================================
+   2. Reset / base
+   ========================================================= */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: radial-gradient(ellipse at top, #1a1d26 0%, #0a0c10 70%);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 20px;
+}
+
+/* =========================================================
+   3. Layout do container
+   ========================================================= */
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.grid {
+  display: grid;
+  gap: 16px;
+}
+
+/* =========================================================
+   4. Header e badge de conexão
+   ========================================================= */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+header h1 {
+  font-size: 22px;
+  font-weight: 700;
+  background: linear-gradient(90deg, #8b5cf6, #22c55e);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.connection-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4b5563;
+}
+
+.dot.online {
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+}
+
+.dot.offline {
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+}
+
+/* =========================================================
+   5. Card de estado (DESARMADO / ARMADO / INVASÃO)
+   ========================================================= */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px;
+  transition: all 0.3s;
+}
+
+.state-card {
+  padding: 32px 24px;
+  text-align: center;
+  background: linear-gradient(135deg, #141821 0%, #1a1f2c 100%);
+  position: relative;
+  overflow: hidden;
+}
+
+.state-icon {
+  font-size: 56px;
+  margin-bottom: 12px;
+  transition: all 0.3s;
+}
+
+.state-title {
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: 3px;
+  transition: all 0.3s;
+}
+
+.state-sub {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 8px;
+}
+
+.state-card.disarmed {
+  border-color: #2a3140;
+}
+
+.state-card.disarmed .state-title {
+  color: var(--muted);
+}
+
+.state-card.armed {
+  border-color: var(--green);
+  box-shadow: 0 0 40px rgba(34, 197, 94, 0.2);
+}
+
+.state-card.armed .state-title {
+  color: var(--green);
+}
+
+.state-card.alarm {
+  border-color: var(--red);
+  animation: pulse-alarm 1s infinite;
+}
+
+.state-card.alarm .state-title {
+  color: var(--red);
+}
+
+@keyframes pulse-alarm {
+  0%, 100% { box-shadow: 0 0 40px rgba(239, 68, 68, 0.3); }
+  50%      { box-shadow: 0 0 80px rgba(239, 68, 68, 0.8); }
+}
+
+/* =========================================================
+   6. Métricas (distância, PIR, LDR, ESP32)
+   ========================================================= */
+.metric-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.metric-value {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.metric-value.green  { color: var(--green); }
+.metric-value.red    { color: var(--red); }
+.metric-value.amber  { color: var(--amber); }
+.metric-value.muted  { color: var(--muted); }
+
+/* =========================================================
+   7. Botões de controle
+   ========================================================= */
+.btn-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.btn-grid .full {
+  grid-column: 1 / -1;
+}
+
+button {
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 14px 18px;
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.2s;
+}
+
+button:active {
+  transform: scale(0.97);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-arm    { background: linear-gradient(135deg, #22c55e, #16a34a); }
+.btn-disarm { background: linear-gradient(135deg, #3b82f6, #2563eb); }
+.btn-reset  { background: linear-gradient(135deg, #ef4444, #dc2626); }
+.btn-test   { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
+.btn-recal  { background: linear-gradient(135deg, #f59e0b, #d97706); }
+
+/* =========================================================
+   8. Log de eventos
+   ========================================================= */
+.log {
+  background: #06080c;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  font-family: 'Consolas', monospace;
+  font-size: 12px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.log-line {
+  padding: 4px 0;
+  border-bottom: 1px solid #111620;
+}
+
+.log-line:last-child {
+  border-bottom: none;
+}
+
+.log-line .time {
+  color: var(--purple);
+  margin-right: 10px;
+}
+
+.log-line .event {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.log-line.alarm  .event { color: var(--red); }
+.log-line.arm    .event { color: var(--green); }
+.log-line.disarm .event { color: var(--blue); }
+
+/* =========================================================
+   9. Footer
+   ========================================================= */
+footer {
+  text-align: center;
+  margin-top: 24px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* =========================================================
+   10. Responsivo
+   ========================================================= */
+@media (min-width: 700px) {
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
+}
