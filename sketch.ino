@@ -2,7 +2,7 @@
   ==================================================================
   SISTEMA DE SEGURANÇA PATRIMONIAL — ESP32 + MQTT + FreeRTOS
   ==================================================================
-  Versão v3.1 — Sirene non-blocking + correções de robustez
+  Versão v3.2 — Clean Code: nomes em inglês + tópicos derivados do prefixo
   ------------------------------------------------------------------
   Sensores : PIR (16) + HC-SR04 (TRIG 5 / ECHO 18) + LDR (34)
   Atuadores: Buzzer 1 (19), Buzzer 2 (23), LED (2)
@@ -28,6 +28,8 @@
     - Fila de eventos drenada ao mudar de estado (evita falso alarme)
     - Recalibração do LDR fora do alarmTask (não bloqueia sirene/LED)
     - Status MQTT compartilhado via flag volatile (PubSubClient não é thread-safe)
+    - Identificadores em inglês (Clean Code); comentários e UI em português
+    - Tópicos MQTT derivados de SECURITY_TOPIC_PREFIX (fonte única)
   ==================================================================
 */
 
@@ -45,14 +47,16 @@ constexpr char WIFI_PASSWORD[] = "";
 constexpr char MQTT_SERVER[]   = "broker.hivemq.com";
 constexpr uint16_t MQTT_PORT   = 1883;
 
-// ⚠️ Troque "meu-esp32" por algo único
-constexpr char TOPIC_BASE[]    = "seguranca/patrimonio/meu-esp32";
-constexpr char TOPIC_CMD[]     = "seguranca/patrimonio/meu-esp32/cmd";
-constexpr char TOPIC_STATE[]   = "seguranca/patrimonio/meu-esp32/state";
-constexpr char TOPIC_ALARM[]   = "seguranca/patrimonio/meu-esp32/alarm";
-constexpr char TOPIC_LOG[]     = "seguranca/patrimonio/meu-esp32/log";
-constexpr char TOPIC_SENSORS[] = "seguranca/patrimonio/meu-esp32/sensors";
-constexpr char TOPIC_STATUS[]  = "seguranca/patrimonio/meu-esp32/status";
+// ⚠️ Fonte única do namespace MQTT — troque "meu-esp32" por algo único.
+// Todos os tópicos abaixo são derivados deste prefixo (mesmo contrato do dashboard).
+#define SECURITY_TOPIC_PREFIX "seguranca/patrimonio/meu-esp32"
+
+constexpr char TOPIC_CMD[]     = SECURITY_TOPIC_PREFIX "/cmd";
+constexpr char TOPIC_STATE[]   = SECURITY_TOPIC_PREFIX "/state";
+constexpr char TOPIC_ALARM[]   = SECURITY_TOPIC_PREFIX "/alarm";
+constexpr char TOPIC_LOG[]     = SECURITY_TOPIC_PREFIX "/log";
+constexpr char TOPIC_SENSORS[] = SECURITY_TOPIC_PREFIX "/sensors";
+constexpr char TOPIC_STATUS[]  = SECURITY_TOPIC_PREFIX "/status";
 
 // Pinos
 constexpr int PIN_PIR      = 16;
@@ -231,7 +235,7 @@ void publishSensors() {
 }
 
 // ===================== WiFi =====================
-void setupWiFi() {
+void setupWifi() {
   Serial.printf("[WiFi] Conectando a %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -257,22 +261,23 @@ void buildClientId() {
 }
 
 // ===================== LDR =====================
-int readLDRAvg() {
-  long soma = 0;
+int readLdrAverage() {
+  long sum = 0;
   for (uint8_t i = 0; i < LDR_AVG_SAMPLES; i++) {
-    soma += analogRead(PIN_LDR);
+    sum += analogRead(PIN_LDR);
   }
-  return soma / LDR_AVG_SAMPLES;
+  return sum / LDR_AVG_SAMPLES;
 }
 
-void calibrarLDR() {
+// Média de calibração define base e limiares de histerese do LDR.
+void calibrateLdr() {
   Serial.println("[LDR] Calibrando...");
-  long soma = 0;
+  long sum = 0;
   for (uint8_t i = 0; i < LDR_CAL_SAMPLES; i++) {
-    soma += analogRead(PIN_LDR);
+    sum += analogRead(PIN_LDR);
     vTaskDelay(pdMS_TO_TICKS(40));
   }
-  g_ldrBase = soma / LDR_CAL_SAMPLES;
+  g_ldrBase = sum / LDR_CAL_SAMPLES;
   g_ldrOn   = g_ldrBase + LDR_DELTA_ON;
   g_ldrOff  = g_ldrBase + LDR_DELTA_OFF;
   if (g_ldrOn  > 4095) g_ldrOn  = 4095;
@@ -283,14 +288,15 @@ void calibrarLDR() {
                 g_ldrBase, g_ldrOn, g_ldrOff);
 }
 
-bool validarAnomaliaLDR(int leitura) {
+// Só reporta anomalia depois de LDR_CONFIRM_MS acima do limiar (evita falso positivo).
+bool validateLdrAnomaly(int reading) {
   uint32_t now = millis();
-  if (leitura > g_ldrOn) {
+  if (reading > g_ldrOn) {
     if (!g_ldrAnomaly) {
       g_ldrAnomaly = true;
       g_ldrStart   = now;
     }
-  } else if (leitura < g_ldrOff) {
+  } else if (reading < g_ldrOff) {
     g_ldrAnomaly = false;
   }
   return g_ldrAnomaly && (now - g_ldrStart >= LDR_CONFIRM_MS);
@@ -319,7 +325,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 // ===================== Task: MQTT (core 0) =====================
 void mqttTask(void* pv) {
-  setupWiFi();
+  setupWifi();
   buildClientId();
   Serial.printf("[MQTT] ClientId = %s\n", g_clientId);
 
@@ -333,7 +339,7 @@ void mqttTask(void* pv) {
   uint32_t count = 0;
 
   for (;;) {
-    if (WiFi.status() != WL_CONNECTED) { setupWiFi(); lastReconnect = 0; }
+    if (WiFi.status() != WL_CONNECTED) { setupWifi(); lastReconnect = 0; }
 
     if (!mqttClient.connected()) {
       g_mqttConnected = false;
@@ -417,7 +423,7 @@ void sensorTask(void* pv) {
     // ─── Recalibração pedida pelo alarmTask (não bloqueia sirene/LED) ───
     if (g_ldrRecalRequested) {
       g_ldrRecalRequested = false;
-      calibrarLDR();
+      calibrateLdr();
       ldrAnomalyPrev = false;
       publishLog("recalibrated");
     }
@@ -460,8 +466,8 @@ void sensorTask(void* pv) {
     }
 
     // ─── LDR ───
-    int ldr = readLDRAvg();
-    bool anomaly = validarAnomaliaLDR(ldr);
+    int ldr = readLdrAverage();
+    bool anomaly = validateLdrAnomaly(ldr);
 
     xSemaphoreTake(statusMutex, portMAX_DELAY);
     g_status.ldr        = ldr;
@@ -765,7 +771,7 @@ void displayTask(void* pv) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== Sistema de Segurança Patrimonial v3.1 ===");
+  Serial.println("\n=== Sistema de Segurança Patrimonial v3.2 ===");
 
   statusMutex = xSemaphoreCreateMutex();
   eventQueue  = xQueueCreate(16, sizeof(Event));
@@ -783,7 +789,7 @@ void setup() {
   ledcAttach(PIN_BUZZER_1, 2000, 10);
   ledcAttach(PIN_BUZZER_2, 2000, 10);
 
-  calibrarLDR();
+  calibrateLdr();
 
   xTaskCreatePinnedToCore(mqttTask,    "MQTT",    6144, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(displayTask, "Display", 4096, nullptr, 1, nullptr, 0);

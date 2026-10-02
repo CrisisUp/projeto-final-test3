@@ -45,13 +45,15 @@ constexpr char WIFI_PASSWORD[] = "";
 constexpr char MQTT_SERVER[]   = "broker.hivemq.com";
 constexpr uint16_t MQTT_PORT   = 1883;
 
-// ⚠️ Deve ser EXATAMENTE o mesmo prefixo do dashboard (app.js)
-constexpr char TOPIC_CMD[]     = "seguranca/patrimonio/meu-esp32/cmd";
-constexpr char TOPIC_STATE[]   = "seguranca/patrimonio/meu-esp32/state";
-constexpr char TOPIC_ALARM[]   = "seguranca/patrimonio/meu-esp32/alarm";
-constexpr char TOPIC_LOG[]     = "seguranca/patrimonio/meu-esp32/log";
-constexpr char TOPIC_SENSORS[] = "seguranca/patrimonio/meu-esp32/sensors";
-constexpr char TOPIC_STATUS[]  = "seguranca/patrimonio/meu-esp32/status";
+// ⚠️ Fonte única — deve ser EXATAMENTE o mesmo prefixo do dashboard (app.js)
+#define SECURITY_TOPIC_PREFIX "seguranca/patrimonio/meu-esp32"
+
+constexpr char TOPIC_CMD[]     = SECURITY_TOPIC_PREFIX "/cmd";
+constexpr char TOPIC_STATE[]   = SECURITY_TOPIC_PREFIX "/state";
+constexpr char TOPIC_ALARM[]   = SECURITY_TOPIC_PREFIX "/alarm";
+constexpr char TOPIC_LOG[]     = SECURITY_TOPIC_PREFIX "/log";
+constexpr char TOPIC_SENSORS[] = SECURITY_TOPIC_PREFIX "/sensors";
+constexpr char TOPIC_STATUS[]  = SECURITY_TOPIC_PREFIX "/status";
 
 constexpr int PIN_BUTTON = 4;
 constexpr int PIN_LED    = 2;

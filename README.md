@@ -269,13 +269,28 @@ Para validar **só a interface** (sem OLED nem FreeRTOS), use o projeto pronto e
 
 O firmware de teste usa **os mesmos tópicos e payloads** do painel e do `sketch.ino` de produção.
 
-**PlatformIO (opcional)**
+**PlatformIO**
 
-- Placa: `esp32dev`
-- Coloque o sketch em `src/main.cpp` (renomeie o conteúdo) ou use o layout de projeto Arduino.
-- Adicione as bibliotecas no `platformio.ini` / Library Manager.
+O repositório já inclui `platformio.ini` na raiz (sem precisar copiar o `.ino` para `src/`).
 
-> A pasta `.vscode/` atual foi gerada para **C/C++ desktop (gcc/gdb)** e **não** serve para compilar/debugar o ESP32. Para o firmware, use Arduino IDE ou PlatformIO.
+| Env | Fonte | Para quê |
+|-----|--------|----------|
+| `esp32dev` | `sketch.ino` | Firmware de produção |
+| `esp32dev_teste` | `firmware_teste/firmware_teste.ino` | Validação do painel |
+
+```powershell
+# na raiz do projeto
+pio run -e esp32dev
+pio run -t upload -e esp32dev
+pio device monitor -e esp32dev
+
+pio run -e esp32dev_teste
+pio run -t upload -e esp32dev_teste
+```
+
+Bibliotecas (resolvidas pelo PlatformIO): PubSubClient, ArduinoJson (v6), Adafruit GFX, Adafruit SSD1306.
+
+> A pasta `.vscode/` atual foi gerada para **C/C++ desktop (gcc/gdb)** e **não** serve para compilar/debugar o ESP32. Use **Arduino IDE**, **PlatformIO** ou o **Wokwi**.
 
 ### Validar o painel com `firmware_teste` (Wokwi)
 
@@ -302,7 +317,7 @@ Checklist de aceitação:
 - [ ] Silenciar / Desarmar recuperam o sistema
 - [ ] Botão físico do Wokwi também alterna o estado
 
-> **Importante:** o tópico padrão é `seguranca/patrimonio/meu-esp32`. Se você já tem outro painel/ESP32 no mesmo broker, mude o prefixo **igual** em `app.js`, `sketch.ino` e `firmware_teste.ino`.
+> **Importante:** o tópico padrão é `seguranca/patrimonio/meu-esp32`. No firmware, troque **apenas** `SECURITY_TOPIC_PREFIX` em `sketch.ino` e `firmware_teste.ino`; no web, o prefixo está em `app.js` (`MQTT_TOPIC_BASE`). Os valores devem ser idênticos.
 
 Exemplo de estado armado:
 
@@ -325,6 +340,7 @@ projeto-final-test3/
 ├── styles.css                    # Tema visual (dark)
 ├── app.js                        # Lógica web + integração MQTT (WSS)
 ├── sketch.ino                    # Firmware de produção (FreeRTOS + OLED + MQTT)
+├── platformio.ini                # Builds PlatformIO (produção + teste)
 ├── .wokwi.toml                   # Config Wokwi da produção (raiz)
 ├── diagram.toml                  # Circuito completo de produção (raiz)
 ├── firmware_teste/
@@ -341,6 +357,7 @@ projeto-final-test3/
 | `styles.css` | Aparência, estados visuais, responsivo |
 | `app.js` | Constantes, renderização, handlers MQTT, bootstrap |
 | `sketch.ino` | Sensores, sirene, OLED, máquina de estados, MQTT |
+| `platformio.ini` | Env `esp32dev` e `esp32dev_teste` (PlatformIO) |
 | `.wokwi.toml` / `diagram.toml` | Projeto Wokwi da **produção** (hardware completo) |
 | `firmware_teste/*` | Projeto Wokwi **leve** só para o painel (botão + LED) |
 | `README.md` | Documentação do projeto e do contrato MQTT |
@@ -350,6 +367,7 @@ projeto-final-test3/
 - **Identificadores** em inglês (Clean Code); **comentários e UI** em português.
 - **IDs do DOM** estáveis (`mDist`, `btnArm`…) — contrato entre HTML e JS.
 - **Constantes nomeadas** no topo de `app.js` e de `sketch.ino` (sem números mágicos espalhados).
+- **Tópicos MQTT** no firmware derivam de `SECURITY_TOPIC_PREFIX` (fonte única); no web, de `MQTT_TOPIC_BASE`.
 - Firmware: eventos por **fila FreeRTOS**; estado compartilhado por **mutex**; sirene/status MQTT por **flags volatile**.
 
 ---
@@ -362,6 +380,7 @@ projeto-final-test3/
 | MQTT (browser) | MQTT.js via CDN (unpkg) — WebSocket 8884 |
 | MQTT (ESP32) | PubSubClient — TCP 1883 |
 | Firmware | Arduino ESP32, FreeRTOS, ArduinoJson, Preferences |
+| Build firmware | Arduino IDE **ou** PlatformIO (`platformio.ini`) |
 | Display | Adafruit SSD1306 (I2C) |
 | Broker | HiveMQ público (`broker.hivemq.com`) |
 | Simulação | Wokwi (opcional) |
@@ -382,7 +401,7 @@ projeto-final-test3/
 
 ---
 
-## Robustez do firmware (v3.1)
+## Robustez do firmware (v3.2)
 
 Correções aplicadas para operação estável com o painel:
 
@@ -393,6 +412,7 @@ Correções aplicadas para operação estável com o painel:
 | Calibração LDR | Executada no `sensorTask` via flag — **não bloqueia** sirene, LED nem eventos |
 | PubSubClient multi-task | `displayTask` lê `g_mqttConnected` (flag volatile), sem tocar no client |
 | Sirene | Task independente; desligada em disarm/reset/timeout |
+| Clean Code (v3.2) | Funções em inglês (`calibrateLdr`, `validateLdrAnomaly`…); tópicos derivados de `SECURITY_TOPIC_PREFIX` |
 
 ---
 
@@ -407,7 +427,8 @@ Itens que elevariam o projeto para uso mais sério — **não implementados** ne
 - Persistência do log (localStorage ou backend)
 - Debounce/timeout de comandos repetidos no painel
 - Testes automatizados dos handlers de mensagem
-- `platformio.ini` versionado e pinout em diagrama de fiação
+- Migração ArduinoJson v6 → v7 (`JsonDocument`)
+- Diagrama de fiação físico (Fritzing) além do Wokwi
 
 ---
 
