@@ -59,6 +59,31 @@
       </div>
     </div>
 
+    <!-- Agendamento de armamento (configuração enviada ao ESP32 via MQTT) -->
+    <div class="card schedule-card" style="margin-top:16px">
+      <div class="metric-label" style="margin-bottom:12px">Horário de Armamento</div>
+      <div class="schedule-form">
+        <label class="schedule-field">
+          <span>Início</span>
+          <input type="time" id="schedArmAt" value="18:00">
+        </label>
+        <label class="schedule-field">
+          <span>Fim</span>
+          <input type="time" id="schedDisarmAt" value="08:00">
+        </label>
+        <label class="schedule-check">
+          <input type="checkbox" id="schedWeekdaysOnly" checked>
+          <span>Só dias úteis</span>
+        </label>
+        <label class="schedule-check">
+          <input type="checkbox" id="schedEnabled" checked>
+          <span>Agendamento ativo</span>
+        </label>
+        <button class="btn-recal full" id="btnSaveSchedule">📅 Salvar horário</button>
+      </div>
+      <div class="schedule-status" id="schedStatus">Aguardando configuração…</div>
+    </div>
+
     <!-- Histórico de eventos do sistema -->
     <div class="card" style="margin-top:16px">
       <div class="metric-label" style="margin-bottom:12px">Histórico de Eventos</div>

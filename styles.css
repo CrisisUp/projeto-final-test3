@@ -235,7 +235,70 @@ button:disabled {
 .btn-recal  { background: linear-gradient(135deg, #f59e0b, #d97706); }
 
 /* =========================================================
-   8. Log de eventos
+   8. Agendamento de armamento
+   ========================================================= */
+.schedule-form {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.schedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.schedule-field span {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.schedule-field input[type="time"] {
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  width: 100%;
+}
+
+.schedule-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  grid-column: span 1;
+}
+
+.schedule-check input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--purple);
+}
+
+.schedule-form .full {
+  grid-column: 1 / -1;
+}
+
+.schedule-status {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.schedule-status.ok    { color: var(--green); }
+.schedule-status.warn  { color: var(--amber); }
+.schedule-status.error { color: var(--red); }
+
+/* =========================================================
+   9. Log de eventos
    ========================================================= */
 .log {
   background: #06080c;
@@ -272,7 +335,7 @@ button:disabled {
 .log-line.disarm .event { color: var(--blue); }
 
 /* =========================================================
-   9. Footer
+   10. Footer
    ========================================================= */
 footer {
   text-align: center;
@@ -282,7 +345,7 @@ footer {
 }
 
 /* =========================================================
-   10. Responsivo
+   11. Responsivo
    ========================================================= */
 @media (min-width: 700px) {
   .grid-2 { grid-template-columns: 1fr 1fr; }

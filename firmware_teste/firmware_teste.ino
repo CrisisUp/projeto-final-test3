@@ -6,7 +6,8 @@
   sketch.ino de produção, sem OLED nem FreeRTOS complexo.
 
   Objetivo: provar que o painel web atualiza e que os comandos
-  do dashboard chegam ao firmware (e vice-versa).
+  do dashboard chegam ao firmware (e vice-versa), incluindo o
+  agendamento de armamento (.../schedule + NTP).
 
   Hardware mínimo (Wokwi):
     - ESP32 DevKit
@@ -15,21 +16,16 @@
 
   Rede: Wokwi-GUEST  |  Broker: broker.hivemq.com:1883
   Tópicos: seguranca/patrimonio/meu-esp32/...
-
-  Como usar no Wokwi:
-    1. Abra o projeto Wokwi do painel (ou crie um com ESP32)
-    2. Cole este código no arquivo do sketch (substituindo o de produção,
-       ou use um sketch separado só para o teste)
-    3. Inicie a simulação
-    4. Abra o index.html e observe: conexão, sensores e comandos
+  NTP: pool.ntp.org (UTC-3)
 
   Comportamento do teste:
     - Publica .../status  = online (LWT = offline)
     - Publica .../state   ao conectar e em cada mudança
     - Publica .../sensors a cada 2 s com valores variados (cores mudam)
+    - Publica .../schedule retained (config ativa)
     - Responde .../cmd: arm, disarm, reset_alarm, test, recalibrate
+    - Recebe .../schedule e aplica bordas de janela via NTP
     - Com sistema ARMADO, dispara alarme automático após ~10 s
-      (simula intrusão — o painel deve ir para INVASÃO)
     - Botão local: DESARMADO → ARMADO → ALARME → DESARMADO
     - Serial 115200 mostra tudo que entra/sai
   ==================================================================
@@ -38,6 +34,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <ctype.h>
 
 // ===================== Configurações =====================
 constexpr char WIFI_SSID[]     = "Wokwi-GUEST";
@@ -48,18 +45,27 @@ constexpr uint16_t MQTT_PORT   = 1883;
 // ⚠️ Fonte única — deve ser EXATAMENTE o mesmo prefixo do dashboard (app.js)
 #define SECURITY_TOPIC_PREFIX "seguranca/patrimonio/meu-esp32"
 
-constexpr char TOPIC_CMD[]     = SECURITY_TOPIC_PREFIX "/cmd";
-constexpr char TOPIC_STATE[]   = SECURITY_TOPIC_PREFIX "/state";
-constexpr char TOPIC_ALARM[]   = SECURITY_TOPIC_PREFIX "/alarm";
-constexpr char TOPIC_LOG[]     = SECURITY_TOPIC_PREFIX "/log";
-constexpr char TOPIC_SENSORS[] = SECURITY_TOPIC_PREFIX "/sensors";
-constexpr char TOPIC_STATUS[]  = SECURITY_TOPIC_PREFIX "/status";
+constexpr char TOPIC_CMD[]      = SECURITY_TOPIC_PREFIX "/cmd";
+constexpr char TOPIC_STATE[]    = SECURITY_TOPIC_PREFIX "/state";
+constexpr char TOPIC_ALARM[]    = SECURITY_TOPIC_PREFIX "/alarm";
+constexpr char TOPIC_LOG[]      = SECURITY_TOPIC_PREFIX "/log";
+constexpr char TOPIC_SENSORS[]  = SECURITY_TOPIC_PREFIX "/sensors";
+constexpr char TOPIC_STATUS[]   = SECURITY_TOPIC_PREFIX "/status";
+constexpr char TOPIC_SCHEDULE[] = SECURITY_TOPIC_PREFIX "/schedule";
+
+// NTP — America/Sao_Paulo sem DST (UTC-3)
+constexpr int32_t NTP_GMT_OFFSET_SEC = -3 * 3600;
+constexpr char NTP_SERVER_1[] = "pool.ntp.org";
+constexpr char NTP_SERVER_2[] = "time.google.com";
+
+constexpr uint16_t SCHEDULE_DEFAULT_ARM_MIN    = 18 * 60;
+constexpr uint16_t SCHEDULE_DEFAULT_DISARM_MIN = 8 * 60;
 
 constexpr int PIN_BUTTON = 4;
 constexpr int PIN_LED    = 2;
 
 constexpr uint32_t SENSOR_PUBLISH_MS = 2000;
-constexpr uint32_t AUTO_ALARM_MS     = 10000;  // armado → alarme "falso" p/ teste
+constexpr uint32_t AUTO_ALARM_MS     = 10000;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 300;
 
 // ===================== Estado =====================
@@ -69,9 +75,18 @@ enum SystemState : uint8_t {
   STATE_ALARM    = 2
 };
 
-SystemState g_state = STATE_DISARMED;
+struct ScheduleConfig {
+  bool     enabled       = false;
+  uint16_t armMinutes    = SCHEDULE_DEFAULT_ARM_MIN;
+  uint16_t disarmMinutes = SCHEDULE_DEFAULT_DISARM_MIN;
+  bool     weekdaysOnly  = true;
+};
 
-// Valores de sensor simulados (o painel deve reagir às cores)
+SystemState g_state = STATE_DISARMED;
+ScheduleConfig g_schedule;
+bool g_scheduleManualHold = false;
+bool g_scheduleWasInside  = false;
+
 int      g_distance = 200;
 bool     g_pir      = false;
 int      g_ldr      = 800;
@@ -82,7 +97,6 @@ uint32_t g_lastSensorPub = 0;
 uint32_t g_lastButtonMs  = 0;
 bool     g_lastButtonReading = HIGH;
 
-// Demo de distância: alterna faixas para ver verde / âmbar / vermelho
 const int DISTANCE_CYCLE[] = { 200, 150, 80, 35, 25, 80, 150, 200 };
 constexpr uint8_t DISTANCE_CYCLE_LEN = sizeof(DISTANCE_CYCLE) / sizeof(DISTANCE_CYCLE[0]);
 uint8_t g_distanceIdx = 0;
@@ -91,7 +105,48 @@ WiFiClient   espClient;
 PubSubClient mqttClient(espClient);
 char g_clientId[40] = {0};
 
-// ===================== Helpers de publicação =====================
+// ===================== Agendamento (helpers) =====================
+bool parseHourMinute(const char* hhmm, uint16_t& outMinutes) {
+  if (!hhmm || strlen(hhmm) != 5 || hhmm[2] != ':') return false;
+  if (!isdigit((unsigned char)hhmm[0]) || !isdigit((unsigned char)hhmm[1]) ||
+      !isdigit((unsigned char)hhmm[3]) || !isdigit((unsigned char)hhmm[4])) {
+    return false;
+  }
+  int h = (hhmm[0] - '0') * 10 + (hhmm[1] - '0');
+  int m = (hhmm[3] - '0') * 10 + (hhmm[4] - '0');
+  if (h < 0 || h > 23 || m < 0 || m > 59) return false;
+  outMinutes = (uint16_t)(h * 60 + m);
+  return true;
+}
+
+void formatHourMinute(uint16_t minutes, char* out, size_t n) {
+  uint16_t m = minutes % 1440;
+  snprintf(out, n, "%02u:%02u", (unsigned)(m / 60), (unsigned)(m % 60));
+}
+
+bool isWeekday(const struct tm& t) {
+  return t.tm_wday >= 1 && t.tm_wday <= 5;
+}
+
+bool isScheduleWindowActive(const ScheduleConfig& cfg, const struct tm& t) {
+  if (!cfg.enabled) return false;
+  if (cfg.weekdaysOnly && !isWeekday(t)) return false;
+
+  uint16_t nowMin = (uint16_t)(t.tm_hour * 60 + t.tm_min);
+  if (cfg.armMinutes == cfg.disarmMinutes) return nowMin == cfg.armMinutes;
+  if (cfg.armMinutes > cfg.disarmMinutes) {
+    return nowMin >= cfg.armMinutes || nowMin < cfg.disarmMinutes;
+  }
+  return nowMin >= cfg.armMinutes && nowMin < cfg.disarmMinutes;
+}
+
+const char* scheduleLabel(const ScheduleConfig& cfg, const struct tm* t, bool hasTime) {
+  if (!cfg.enabled || !hasTime || !t) return "idle";
+  if (!isScheduleWindowActive(cfg, *t)) return "idle";
+  return g_scheduleManualHold ? "override" : "active";
+}
+
+// ===================== Publicação =====================
 void publishLog(const char* event) {
   StaticJsonDocument<128> doc;
   doc["event"] = event;
@@ -104,14 +159,21 @@ void publishLog(const char* event) {
 }
 
 void publishState() {
-  StaticJsonDocument<64> doc;
+  StaticJsonDocument<160> doc;
   doc["armed"] = (g_state != STATE_DISARMED);
   doc["alarm"] = (g_state == STATE_ALARM);
-  char buf[64];
+
+  struct tm timeinfo;
+  bool hasTime = getLocalTime(&timeinfo, 0);
+  const char* schedLabel = scheduleLabel(g_schedule, hasTime ? &timeinfo : nullptr, hasTime);
+  doc["schedule"] = schedLabel;
+
+  char buf[160];
   serializeJson(doc, buf, sizeof(buf));
   mqttClient.publish(TOPIC_STATE, buf);
-  Serial.printf("[STATE] armed=%d alarm=%d\n",
-                g_state != STATE_DISARMED, g_state == STATE_ALARM);
+  Serial.printf("[STATE] armed=%d alarm=%d schedule=%s\n",
+                g_state != STATE_DISARMED, g_state == STATE_ALARM,
+                schedLabel);
 }
 
 void publishAlarm(const char* type, uint16_t value) {
@@ -134,6 +196,23 @@ void publishSensors() {
   char buf[128];
   serializeJson(doc, buf, sizeof(buf));
   mqttClient.publish(TOPIC_SENSORS, buf);
+}
+
+void publishSchedule() {
+  StaticJsonDocument<192> doc;
+  char armBuf[8];
+  char disarmBuf[8];
+  formatHourMinute(g_schedule.armMinutes, armBuf, sizeof(armBuf));
+  formatHourMinute(g_schedule.disarmMinutes, disarmBuf, sizeof(disarmBuf));
+
+  doc["enabled"]      = g_schedule.enabled;
+  doc["armAt"]        = armBuf;
+  doc["disarmAt"]     = disarmBuf;
+  doc["weekdaysOnly"] = g_schedule.weekdaysOnly;
+
+  char buf[192];
+  serializeJson(doc, buf, sizeof(buf));
+  mqttClient.publish(TOPIC_SCHEDULE, buf, true);
 }
 
 // ===================== Máquina de estados =====================
@@ -162,27 +241,67 @@ void triggerAlarm(const char* type, uint16_t value) {
 }
 
 void beep(uint16_t freq, uint16_t ms) {
-  // Sem buzzer dedicado no teste: só feedback no Serial + LED
   Serial.printf("[BEEP] %u Hz / %u ms\n", freq, ms);
   digitalWrite(PIN_LED, HIGH);
   delay(ms);
   digitalWrite(PIN_LED, g_state == STATE_ALARM ? HIGH : LOW);
 }
 
+// Override: desarmar dentro da janela segura até o fim dela.
+void markManualHoldIfInWindow() {
+  struct tm timeinfo;
+  if (g_schedule.enabled && getLocalTime(&timeinfo, 0) &&
+      isScheduleWindowActive(g_schedule, timeinfo)) {
+    g_scheduleManualHold = true;
+    Serial.println("[SCHED] override manual (hold até o fim da janela)");
+  }
+}
+
+// Borda de janela via NTP (chamado no loop).
+void evaluateSchedule() {
+  struct tm timeinfo;
+  bool hasTime = getLocalTime(&timeinfo, 0);
+  bool inside = false;
+
+  if (g_schedule.enabled && hasTime) {
+    inside = isScheduleWindowActive(g_schedule, timeinfo);
+  }
+
+  if (inside && !g_scheduleWasInside) {
+    if (g_scheduleManualHold) {
+      publishLog("schedule_skipped");
+      Serial.println("[SCHED] início com hold manual — não rearmou");
+    } else if (g_state == STATE_DISARMED) {
+      setState(STATE_ARMED, "schedule_armed");
+      beep(1200, 120);
+      beep(1600, 180);
+      Serial.println("[SCHED] ARM (agendamento)");
+    }
+  }
+
+  if (!inside && g_scheduleWasInside) {
+    g_scheduleManualHold = false;
+    if (g_state != STATE_DISARMED) {
+      setState(STATE_DISARMED, "schedule_disarmed");
+      beep(1600, 120);
+      beep(1000, 200);
+      Serial.println("[SCHED] DISARM (fim da janela)");
+    } else {
+      publishState();
+    }
+  }
+
+  g_scheduleWasInside = inside;
+}
+
 // ===================== Sensores simulados =====================
 void updateSimulatedSensors() {
-  // Distância: percorre faixas de cor do painel
   g_distanceIdx = (g_distanceIdx + 1) % DISTANCE_CYCLE_LEN;
   g_distance = DISTANCE_CYCLE[g_distanceIdx];
-
-  // PIR: pulsa em algumas amostras
   g_pir = (g_distanceIdx % 3 == 0);
-
-  // LDR: varia e occasionalmente sinaliza anomalia
   g_ldr = 400 + (g_distanceIdx * 150) % 2000;
   g_ldrAnomaly = (g_distanceIdx == 5);
 
-  // Só "intruso" conta se o sistema estiver armado
   if (g_state == STATE_ARMED) {
     if (g_distance < 40) {
       triggerAlarm("proximity", (uint16_t)g_distance);
@@ -202,6 +321,7 @@ void handleCommand(const char* action) {
 
   if (!strcmp(action, "arm")) {
     if (g_state == STATE_DISARMED) {
+      g_scheduleManualHold = false;
       setState(STATE_ARMED, "armed");
       beep(1200, 120);
       beep(1600, 180);
@@ -210,6 +330,7 @@ void handleCommand(const char* action) {
     }
   } else if (!strcmp(action, "disarm")) {
     if (g_state != STATE_DISARMED) {
+      markManualHoldIfInWindow();
       setState(STATE_DISARMED, "disarmed");
       beep(1600, 120);
       beep(1000, 200);
@@ -218,7 +339,6 @@ void handleCommand(const char* action) {
     }
   } else if (!strcmp(action, "reset_alarm")) {
     if (g_state == STATE_ALARM) {
-      // Volta a ARMADO (mesmo contrato do firmware de produção)
       setState(STATE_ARMED, "alarm_reset");
       beep(900, 100);
       beep(900, 100);
@@ -232,7 +352,6 @@ void handleCommand(const char* action) {
     beep(2000, 120);
   } else if (!strcmp(action, "recalibrate")) {
     publishLog("recalibrating");
-    // Simula calibração rápida (sem bloquear demais o loop)
     delay(200);
     g_ldr = 900;
     g_ldrAnomaly = false;
@@ -243,8 +362,57 @@ void handleCommand(const char* action) {
   }
 }
 
+void handleScheduleConfigMessage(const uint8_t* payload, unsigned int length) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, payload, length)) {
+    Serial.println("[SCHED] JSON inválido");
+    publishLog("schedule_invalid");
+    return;
+  }
+
+  ScheduleConfig next;
+  next.enabled      = doc["enabled"] | false;
+  next.weekdaysOnly = doc["weekdaysOnly"] | true;
+
+  const char* armAt    = doc["armAt"] | "";
+  const char* disarmAt = doc["disarmAt"] | "";
+  if (!parseHourMinute(armAt, next.armMinutes) ||
+      !parseHourMinute(disarmAt, next.disarmMinutes)) {
+    Serial.println("[SCHED] Horário inválido");
+    publishLog("schedule_invalid");
+    return;
+  }
+
+  bool configChanged =
+      g_schedule.enabled != next.enabled ||
+      g_schedule.armMinutes != next.armMinutes ||
+      g_schedule.disarmMinutes != next.disarmMinutes ||
+      g_schedule.weekdaysOnly != next.weekdaysOnly;
+
+  g_schedule = next;
+  if (!next.enabled || configChanged) {
+    g_scheduleManualHold = false;
+  }
+
+  char armBuf[8];
+  char disarmBuf[8];
+  formatHourMinute(next.armMinutes, armBuf, sizeof(armBuf));
+  formatHourMinute(next.disarmMinutes, disarmBuf, sizeof(disarmBuf));
+  Serial.printf("[SCHED] saved %s-%s wd=%d en=%d\n",
+                armBuf, disarmBuf, next.weekdaysOnly, next.enabled);
+
+  publishSchedule();
+  publishLog("schedule_saved");
+  publishState();
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] RX %s (%u bytes)\n", topic, length);
+
+  if (!strcmp(topic, TOPIC_SCHEDULE)) {
+    handleScheduleConfigMessage(payload, length);
+    return;
+  }
 
   StaticJsonDocument<128> doc;
   if (deserializeJson(doc, payload, length)) {
@@ -273,6 +441,11 @@ void setupWiFi() {
   Serial.printf("\n[WiFi] %s — IP: %s\n",
                 WiFi.status() == WL_CONNECTED ? "OK" : "FALHA",
                 WiFi.localIP().toString().c_str());
+
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(NTP_GMT_OFFSET_SEC, 0, NTP_SERVER_1, NTP_SERVER_2);
+    Serial.println("[NTP] configTime solicitado");
+  }
 }
 
 void buildClientId() {
@@ -290,13 +463,14 @@ bool connectMqtt() {
   Serial.print("[MQTT] Conectando...");
   buildClientId();
 
-  // LWT: se cair, o painel deve mostrar ESP32 offline
   if (mqttClient.connect(g_clientId, nullptr, nullptr,
                          TOPIC_STATUS, 0, true, "offline")) {
     Serial.println("OK");
     mqttClient.publish(TOPIC_STATUS, "online", true);
     mqttClient.subscribe(TOPIC_CMD);
+    mqttClient.subscribe(TOPIC_SCHEDULE);
     publishState();
+    publishSchedule();
     publishLog("boot");
     publishSensors();
     return true;
@@ -316,12 +490,13 @@ void pollButton() {
     g_lastButtonMs = now;
 
     if (g_state == STATE_DISARMED) {
+      g_scheduleManualHold = false;
       setState(STATE_ARMED, "armed_button");
       beep(1200, 120);
     } else if (g_state == STATE_ARMED) {
-      // Segunda pressão no armado: simula intrusão
       triggerAlarm("button", 0);
     } else {
+      markManualHoldIfInWindow();
       setState(STATE_DISARMED, "disarmed_button");
       beep(1600, 150);
     }
@@ -334,7 +509,7 @@ void pollButton() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== Firmware de TESTE — Segurança Patrimonial ===");
+  Serial.println("\n=== Firmware de TESTE — Segurança Patrimonial (agendamento) ===");
   Serial.println("Valida o painel web via MQTT (sem OLED / FreeRTOS)");
 
   pinMode(PIN_BUTTON, INPUT_PULLUP);
@@ -360,13 +535,13 @@ void loop() {
   }
   mqttClient.loop();
 
-  // Sensores simulados + publicação periódica
+  evaluateSchedule();
+
   if (millis() - g_lastSensorPub >= SENSOR_PUBLISH_MS) {
     g_lastSensorPub = millis();
     updateSimulatedSensors();
   }
 
-  // Alarme automático de demonstração (só se armado)
   if (g_state == STATE_ARMED && millis() - g_armTimeMs >= AUTO_ALARM_MS) {
     Serial.println("[TESTE] Auto-alarme de demonstração");
     triggerAlarm("pir", 0);
@@ -374,7 +549,6 @@ void loop() {
 
   pollButton();
 
-  // LED pisca durante alarme
   if (g_state == STATE_ALARM) {
     digitalWrite(PIN_LED, (millis() / 200) % 2 ? HIGH : LOW);
   }

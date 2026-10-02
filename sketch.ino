@@ -2,7 +2,7 @@
   ==================================================================
   SISTEMA DE SEGURANÇA PATRIMONIAL — ESP32 + MQTT + FreeRTOS
   ==================================================================
-  Versão v3.2 — Clean Code: nomes em inglês + tópicos derivados do prefixo
+  Versão v3.3 — agendamento de armamento (janela diária + NTP)
   ------------------------------------------------------------------
   Sensores : PIR (16) + HC-SR04 (TRIG 5 / ECHO 18) + LDR (34)
   Atuadores: Buzzer 1 (19), Buzzer 2 (23), LED (2)
@@ -10,26 +10,22 @@
   Entrada  : Botão (4, INPUT_PULLUP)
   Rede     : Wokwi-GUEST
   Broker   : broker.hivemq.com (TCP 1883)
-  NVS      : estado persistente
+  NVS      : estado + agendamento
+  NTP      : pool.ntp.org (UTC-3, America/Sao_Paulo sem DST)
 
   Arquitetura: 5 tasks FreeRTOS em 2 cores
     mqttTask    (core 0) → WiFi + MQTT (publish/subscribe)
     displayTask (core 0) → OLED a cada 250ms
     sensorTask  (core 1) → PIR, HC-SR04, LDR, botão → eventQueue
-    alarmTask   (core 1) → máquina de estados + LED
+    alarmTask   (core 1) → máquina de estados + LED + bordas de schedule
     sirenTask   (core 1) → sirene contínua controlada por flag
 
-  Melhorias principais:
-    - Sirene em task separada (resposta < 50ms a comandos)
-    - Média móvel no HC-SR04 (elimina ruído)
-    - LDR com calibração automática + histerese
-    - Persistência NVS do estado
-    - PIR/LDR enfileiram apenas na borda de transição (sem flood)
-    - Fila de eventos drenada ao mudar de estado (evita falso alarme)
-    - Recalibração do LDR fora do alarmTask (não bloqueia sirene/LED)
-    - Status MQTT compartilhado via flag volatile (PubSubClient não é thread-safe)
-    - Identificadores em inglês (Clean Code); comentários e UI em português
-    - Tópicos MQTT derivados de SECURITY_TOPIC_PREFIX (fonte única)
+  Agendamento (v3.3):
+    - Tópico .../schedule: painel publica; ESP32 persiste em NVS e re-broadcasta (retained)
+    - Janela diária HH:MM→HH:MM (pode cruzar meia-noite); opcional só dias úteis
+    - ESP32 com NTP é a autoridade: arma no início e desarma no fim da janela
+    - Override: desarmar dentro da janela segura até o fim dela (g_scheduleManualHold)
+    - Eventos: schedule_saved / schedule_armed / schedule_disarmed / schedule_skipped
   ==================================================================
 */
 
@@ -40,6 +36,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <ctype.h>
 
 // ===================== Configurações =====================
 constexpr char WIFI_SSID[]     = "Wokwi-GUEST";
@@ -57,6 +54,17 @@ constexpr char TOPIC_ALARM[]   = SECURITY_TOPIC_PREFIX "/alarm";
 constexpr char TOPIC_LOG[]     = SECURITY_TOPIC_PREFIX "/log";
 constexpr char TOPIC_SENSORS[] = SECURITY_TOPIC_PREFIX "/sensors";
 constexpr char TOPIC_STATUS[]  = SECURITY_TOPIC_PREFIX "/status";
+constexpr char TOPIC_SCHEDULE[] = SECURITY_TOPIC_PREFIX "/schedule";
+
+// NTP — America/Sao_Paulo sem DST (UTC-3). Ajuste se o hardware for em outro fuso.
+constexpr int32_t NTP_GMT_OFFSET_SEC = -3 * 3600;
+constexpr int32_t NTP_DST_OFFSET_SEC = 0;
+constexpr char NTP_SERVER_1[] = "pool.ntp.org";
+constexpr char NTP_SERVER_2[] = "time.google.com";
+
+// Agendamento de armamento (janela diária; pode cruzar meia-noite).
+constexpr uint16_t SCHEDULE_DEFAULT_ARM_MIN    = 18 * 60;  // 18:00
+constexpr uint16_t SCHEDULE_DEFAULT_DISARM_MIN = 8 * 60;   // 08:00
 
 // Pinos
 constexpr int PIN_PIR      = 16;
@@ -111,6 +119,7 @@ struct Event {
 struct TxMessage {
   char topic[80];
   char payload[200];
+  bool retain = false;
 };
 
 enum SystemState : uint8_t {
@@ -127,6 +136,14 @@ struct SystemStatus {
   bool        ldrAnomaly  = false;
   uint32_t    lastPirMs   = 0;
   uint32_t    lastAlarmMs = 0;
+};
+
+// Janela diária de armamento: minutos desde 00:00.
+struct ScheduleConfig {
+  bool     enabled       = false;
+  uint16_t armMinutes    = SCHEDULE_DEFAULT_ARM_MIN;
+  uint16_t disarmMinutes = SCHEDULE_DEFAULT_DISARM_MIN;
+  bool     weekdaysOnly  = true;
 };
 
 // ===================== Globais =====================
@@ -150,6 +167,11 @@ volatile bool g_mqttConnected = false;
 
 // Recalibração LDR: alarmTask pede; sensorTask executa (não bloqueia o alarme)
 volatile bool g_ldrRecalRequested = false;
+
+// Agendamento: config em RAM (mutex); hold manual e NTP como flags voláteis.
+ScheduleConfig g_schedule;
+volatile bool  g_scheduleManualHold = false;
+volatile bool  g_timeSynced = false;
 
 // LDR
 int      g_ldrBase    = 2000;
@@ -176,11 +198,94 @@ void nvsSaveState(SystemState s) {
   prefs.end();
 }
 
+void nvsLoadSchedule() {
+  prefs.begin("security", true);
+  g_schedule.enabled       = prefs.getUChar("sched_en", 0) != 0;
+  g_schedule.armMinutes    = prefs.getUShort("sched_arm", SCHEDULE_DEFAULT_ARM_MIN);
+  g_schedule.disarmMinutes = prefs.getUShort("sched_dis", SCHEDULE_DEFAULT_DISARM_MIN);
+  g_schedule.weekdaysOnly  = prefs.getUChar("sched_wd", 1) != 0;
+  prefs.end();
+  Serial.printf("[NVS] Schedule: en=%d arm=%u disarm=%u wd=%d\n",
+                g_schedule.enabled, g_schedule.armMinutes,
+                g_schedule.disarmMinutes, g_schedule.weekdaysOnly);
+}
+
+void nvsSaveSchedule(const ScheduleConfig& cfg) {
+  prefs.begin("security", false);
+  prefs.putUChar("sched_en", cfg.enabled ? 1 : 0);
+  prefs.putUShort("sched_arm", cfg.armMinutes);
+  prefs.putUShort("sched_dis", cfg.disarmMinutes);
+  prefs.putUChar("sched_wd", cfg.weekdaysOnly ? 1 : 0);
+  prefs.end();
+}
+
+// ===================== Agendamento (helpers) =====================
+bool parseHourMinute(const char* hhmm, uint16_t& outMinutes) {
+  if (!hhmm || strlen(hhmm) != 5 || hhmm[2] != ':') return false;
+  if (!isdigit((unsigned char)hhmm[0]) || !isdigit((unsigned char)hhmm[1]) ||
+      !isdigit((unsigned char)hhmm[3]) || !isdigit((unsigned char)hhmm[4])) {
+    return false;
+  }
+  int h = (hhmm[0] - '0') * 10 + (hhmm[1] - '0');
+  int m = (hhmm[3] - '0') * 10 + (hhmm[4] - '0');
+  if (h < 0 || h > 23 || m < 0 || m > 59) return false;
+  outMinutes = (uint16_t)(h * 60 + m);
+  return true;
+}
+
+void formatHourMinute(uint16_t minutes, char* out, size_t n) {
+  uint16_t m = minutes % 1440;
+  snprintf(out, n, "%02u:%02u", (unsigned)(m / 60), (unsigned)(m % 60));
+}
+
+bool isWeekday(const struct tm& t) {
+  // tm_wday: 0=domingo … 6=sábado → dias úteis 1–5
+  return t.tm_wday >= 1 && t.tm_wday <= 5;
+}
+
+// Janela ativa no minuto atual; trata virada de meia-noite (ex.: 18:00→08:00).
+bool isScheduleWindowActive(const ScheduleConfig& cfg, const struct tm& t) {
+  if (!cfg.enabled) return false;
+  if (cfg.weekdaysOnly && !isWeekday(t)) return false;
+
+  uint16_t nowMin = (uint16_t)(t.tm_hour * 60 + t.tm_min);
+  if (cfg.armMinutes == cfg.disarmMinutes) {
+    // Janela nula: considera ativa o minuto exato do início (raro).
+    return nowMin == cfg.armMinutes;
+  }
+  if (cfg.armMinutes > cfg.disarmMinutes) {
+    // Cruzamento de meia-noite: [arm, 24h) ∪ [0, disarm)
+    return nowMin >= cfg.armMinutes || nowMin < cfg.disarmMinutes;
+  }
+  // Mesmo dia: [arm, disarm)
+  return nowMin >= cfg.armMinutes && nowMin < cfg.disarmMinutes;
+}
+
+ScheduleConfig copyScheduleConfig() {
+  ScheduleConfig snap;
+  xSemaphoreTake(statusMutex, portMAX_DELAY);
+  snap = g_schedule;
+  xSemaphoreGive(statusMutex);
+  return snap;
+}
+
+const char* scheduleLabel(const ScheduleConfig& cfg, const struct tm* t, bool hasTime, bool manualHold) {
+  if (!cfg.enabled || !hasTime || !t) return "idle";
+  if (!isScheduleWindowActive(cfg, *t)) return "idle";
+  return manualHold ? "override" : "active";
+}
+
+// Lê o relógio local sem bloquear a task por muito tempo.
+bool readLocalTime(struct tm& out) {
+  return getLocalTime(&out, 50);
+}
+
 // ===================== Fila TX =====================
-void enqueueTx(const char* topic, const char* payload) {
+void enqueueTx(const char* topic, const char* payload, bool retain = false) {
   TxMessage m{};
   strncpy(m.topic, topic, sizeof(m.topic) - 1);
   strncpy(m.payload, payload, sizeof(m.payload) - 1);
+  m.retain = retain;
   if (xQueueSend(txQueue, &m, 0) != pdTRUE) {
     Serial.println("[TX] fila cheia");
   }
@@ -195,12 +300,39 @@ void drainEventQueue() {
 
 // ===================== Publicação MQTT =====================
 void publishState() {
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<160> doc;
   doc["armed"] = (g_status.state != STATE_DISARMED);
   doc["alarm"] = (g_status.state == STATE_ALARM);
-  char buf[128];
+
+  struct tm timeinfo;
+  bool hasTime = readLocalTime(timeinfo);
+  ScheduleConfig cfg = copyScheduleConfig();
+  doc["schedule"] = scheduleLabel(cfg, hasTime ? &timeinfo : nullptr,
+                                  hasTime, g_scheduleManualHold);
+
+  char buf[160];
   serializeJson(doc, buf, sizeof(buf));
   enqueueTx(TOPIC_STATE, buf);
+}
+
+void publishSchedule() {
+  StaticJsonDocument<192> doc;
+  ScheduleConfig cfg = copyScheduleConfig();
+
+  char armBuf[8];
+  char disarmBuf[8];
+  formatHourMinute(cfg.armMinutes, armBuf, sizeof(armBuf));
+  formatHourMinute(cfg.disarmMinutes, disarmBuf, sizeof(disarmBuf));
+
+  doc["enabled"]      = cfg.enabled;
+  doc["armAt"]        = armBuf;
+  doc["disarmAt"]     = disarmBuf;
+  doc["weekdaysOnly"] = cfg.weekdaysOnly;
+
+  char buf[192];
+  serializeJson(doc, buf, sizeof(buf));
+  // Retained: o painel reexibe a config ao reconectar.
+  enqueueTx(TOPIC_SCHEDULE, buf, true);
 }
 
 void publishAlarm(const char* type, uint16_t value) {
@@ -249,6 +381,12 @@ void setupWifi() {
   Serial.printf("\n[WiFi] %s — IP: %s\n",
                 WiFi.status() == WL_CONNECTED ? "OK" : "FALHA",
                 WiFi.localIP().toString().c_str());
+
+  // NTP para o agendamento de armamento (só após WiFi OK).
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(NTP_GMT_OFFSET_SEC, NTP_DST_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+    Serial.println("[NTP] configTime solicitado (pool.ntp.org / time.google.com)");
+  }
 }
 
 void buildClientId() {
@@ -303,8 +441,66 @@ bool validateLdrAnomaly(int reading) {
 }
 
 // ===================== MQTT callback =====================
+// Aplica config de agendamento vinda do painel (tópico .../schedule).
+void handleScheduleConfigMessage(const uint8_t* payload, unsigned int length) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, payload, length)) {
+    Serial.println("[SCHED] JSON inválido");
+    publishLog("schedule_invalid");
+    return;
+  }
+
+  ScheduleConfig next;
+  next.enabled       = doc["enabled"] | false;
+  next.weekdaysOnly  = doc["weekdaysOnly"] | true;
+
+  const char* armAt    = doc["armAt"] | "";
+  const char* disarmAt = doc["disarmAt"] | "";
+  if (!parseHourMinute(armAt, next.armMinutes) ||
+      !parseHourMinute(disarmAt, next.disarmMinutes)) {
+    Serial.println("[SCHED] Horário inválido");
+    publishLog("schedule_invalid");
+    return;
+  }
+
+  ScheduleConfig prev = copyScheduleConfig();
+  bool configChanged =
+      prev.enabled != next.enabled ||
+      prev.armMinutes != next.armMinutes ||
+      prev.disarmMinutes != next.disarmMinutes ||
+      prev.weekdaysOnly != next.weekdaysOnly;
+
+  xSemaphoreTake(statusMutex, portMAX_DELAY);
+  g_schedule = next;
+  xSemaphoreGive(statusMutex);
+
+  nvsSaveSchedule(next);
+
+  // Religar o agendamento (ou mudar a janela) limpa o override manual.
+  if (!next.enabled || configChanged) {
+    g_scheduleManualHold = false;
+  }
+
+  char armBuf[8];
+  char disarmBuf[8];
+  formatHourMinute(next.armMinutes, armBuf, sizeof(armBuf));
+  formatHourMinute(next.disarmMinutes, disarmBuf, sizeof(disarmBuf));
+  Serial.printf("[SCHED] saved %s-%s wd=%d en=%d\n",
+                armBuf, disarmBuf, next.weekdaysOnly, next.enabled);
+
+  publishSchedule();
+  publishLog("schedule_saved");
+  publishState();
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] RX %s (%u)\n", topic, length);
+
+  if (!strcmp(topic, TOPIC_SCHEDULE)) {
+    handleScheduleConfigMessage(payload, length);
+    return;
+  }
+
   StaticJsonDocument<160> doc;
   if (deserializeJson(doc, payload, length)) return;
 
@@ -355,7 +551,9 @@ void mqttTask(void* pv) {
           g_mqttConnected = true;
           mqttClient.publish(TOPIC_STATUS, "online", true);
           mqttClient.subscribe(TOPIC_CMD);
+          mqttClient.subscribe(TOPIC_SCHEDULE);
           publishState();
+          publishSchedule();  // retained: painel reexibe a janela
           publishLog("boot");
         } else {
           Serial.printf("rc=%d\n", mqttClient.state());
@@ -366,8 +564,12 @@ void mqttTask(void* pv) {
 
       TxMessage m;
       while (xQueueReceive(txQueue, &m, 0) == pdTRUE) {
-        mqttClient.publish(m.topic, m.payload);
+        mqttClient.publish(m.topic, m.payload, m.retain);
       }
+
+      // Marca se o NTP já respondeu (alarmTask usa getLocalTime direto).
+      struct tm probe;
+      g_timeSynced = getLocalTime(&probe, 0);
 
       if (millis() - lastSensorPub > 2000) {
         lastSensorPub = millis();
@@ -542,6 +744,39 @@ void playBeep(uint16_t freq, uint16_t ms) {
   ledcWriteTone(PIN_BUZZER_2, 0);
 }
 
+// Transição para ARMADO (manual ou agendamento). Retorna true se mudou de estado.
+bool requestArm(const char* reasonLog) {
+  if (g_status.state != STATE_DISARMED) return false;
+  g_status.state = STATE_ARMED;
+  nvsSaveState(STATE_ARMED);
+  drainEventQueue();
+  publishLog(reasonLog);
+  playBeep(1200, 150); vTaskDelay(pdMS_TO_TICKS(80));
+  playBeep(1600, 200);
+  return true;
+}
+
+// Transição para DESARMADO. Retorna true se mudou de estado.
+bool requestDisarm(const char* reasonLog) {
+  if (g_status.state == STATE_DISARMED) return false;
+  g_status.state = STATE_DISARMED;
+  nvsSaveState(STATE_DISARMED);
+  drainEventQueue();
+  g_sirenActive = false;
+  digitalWrite(PIN_LED, LOW);
+  publishLog(reasonLog);
+  playBeep(1600, 150); vTaskDelay(pdMS_TO_TICKS(80));
+  playBeep(1000, 250);
+  return true;
+}
+
+// Desarma se ainda estiver armado/alarme no fim da janela de agendamento.
+void applyScheduleExit() {
+  if (g_status.state != STATE_DISARMED) {
+    requestDisarm("schedule_disarmed");
+  }
+}
+
 void alarmTask(void* pv) {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
@@ -550,6 +785,8 @@ void alarmTask(void* pv) {
   bool ledBlink = false;
   uint32_t lastBlink = 0;
   uint32_t alarmStart = 0;
+  bool scheduleWasInside = false;
+  bool scheduleTimeMissingLogged = false;
 
   for (;;) {
     // ─── Processa eventos (sempre responde em 50ms) ───
@@ -562,25 +799,25 @@ void alarmTask(void* pv) {
 
         case EVT_CMD_ARM:
           if (g_status.state == STATE_DISARMED) {
-            g_status.state = STATE_ARMED;
-            nvsSaveState(STATE_ARMED);
-            // Remove eventos velhos (PIR/LDR ainda ativos do período desarmado)
-            drainEventQueue();
-            logMsg = "armed"; logIt = true;
-            playBeep(1200, 150); vTaskDelay(pdMS_TO_TICKS(80));
-            playBeep(1600, 200);
+            // Armar manual limpa o hold: o usuário assumiu o controle.
+            g_scheduleManualHold = false;
+            requestArm("armed");
+            logIt = false;  // requestArm já publica o log
           }
           break;
 
         case EVT_CMD_DISARM:
           if (g_status.state != STATE_DISARMED) {
-            g_status.state = STATE_DISARMED;
-            nvsSaveState(STATE_DISARMED);
-            drainEventQueue();
-            logMsg = "disarmed"; logIt = true;
-            g_sirenActive = false;              // ← desliga sirene
-            playBeep(1600, 150); vTaskDelay(pdMS_TO_TICKS(80));
-            playBeep(1000, 250);
+            // Override: desarmar dentro da janela impede rearme até o fim dela.
+            ScheduleConfig cfg = copyScheduleConfig();
+            struct tm timeinfo;
+            if (cfg.enabled && readLocalTime(timeinfo) &&
+                isScheduleWindowActive(cfg, timeinfo)) {
+              g_scheduleManualHold = true;
+              Serial.println("[SCHED] override manual (hold até o fim da janela)");
+            }
+            requestDisarm("disarmed");
+            logIt = false;
           }
           break;
 
@@ -615,22 +852,18 @@ void alarmTask(void* pv) {
 
         case EVT_BUTTON:
           if (g_status.state == STATE_DISARMED) {
-            g_status.state = STATE_ARMED;
-            nvsSaveState(STATE_ARMED);
-            drainEventQueue();
-            logMsg = "armed_button"; logIt = true;
-            playBeep(1200, 150); vTaskDelay(pdMS_TO_TICKS(80));
-            playBeep(1600, 200);
+            g_scheduleManualHold = false;
+            requestArm("armed_button");
+            logIt = false;
           } else {
-            // Qualquer outro estado → desarma e silencia
-            g_status.state = STATE_DISARMED;
-            nvsSaveState(STATE_DISARMED);
-            drainEventQueue();
-            logMsg = "disarmed_button"; logIt = true;
-            g_sirenActive = false;              // ← desliga sirene
-            digitalWrite(PIN_LED, LOW);
-            playBeep(1600, 150); vTaskDelay(pdMS_TO_TICKS(80));
-            playBeep(1000, 250);
+            ScheduleConfig cfg = copyScheduleConfig();
+            struct tm timeinfo;
+            if (cfg.enabled && readLocalTime(timeinfo) &&
+                isScheduleWindowActive(cfg, timeinfo)) {
+              g_scheduleManualHold = true;
+            }
+            requestDisarm("disarmed_button");
+            logIt = false;
           }
           break;
 
@@ -670,6 +903,55 @@ void alarmTask(void* pv) {
 
       if (g_status.state != prev) publishState();
       if (logIt) { publishLog(logMsg); Serial.printf("[EVT] %s\n", logMsg); }
+    }
+
+    // ─── Agendamento: bordas de janela via NTP (não bloqueia o loop) ───
+    {
+      ScheduleConfig cfg = copyScheduleConfig();
+      struct tm timeinfo;
+      bool hasTime = readLocalTime(timeinfo);
+      g_timeSynced = hasTime;
+
+      bool inside = false;
+      if (cfg.enabled && hasTime) {
+        inside = isScheduleWindowActive(cfg, timeinfo);
+      } else if (cfg.enabled && !hasTime && !scheduleTimeMissingLogged) {
+        publishLog("schedule_time_missing");
+        scheduleTimeMissingLogged = true;
+        Serial.println("[SCHED] NTP ainda não sincronizado");
+      }
+
+      if (hasTime) scheduleTimeMissingLogged = false;
+
+      // Borda de entrada na janela
+      if (inside && !scheduleWasInside) {
+        if (g_scheduleManualHold) {
+          publishLog("schedule_skipped");
+          Serial.println("[SCHED] início com hold manual — não rearmou");
+        } else if (g_status.state == STATE_DISARMED) {
+          requestArm("schedule_armed");
+          publishState();
+          Serial.println("[SCHED] ARM (agendamento)");
+        }
+      }
+
+      // Borda de saída da janela (ou agendamento desligado / sem hora)
+      if (!inside && scheduleWasInside) {
+        g_scheduleManualHold = false;
+        applyScheduleExit();
+        publishState();
+        Serial.println("[SCHED] DISARM (fim da janela)");
+      }
+
+      // Sem hora e agendamento ativo: se estava "dentro" no cache, trata como saída
+      if (cfg.enabled && !hasTime && scheduleWasInside) {
+        g_scheduleManualHold = false;
+        applyScheduleExit();
+        publishState();
+        scheduleWasInside = false;
+      }
+
+      scheduleWasInside = inside;
     }
 
     // ─── Estado atual: apenas sinaliza para a sirenTask ───
@@ -761,6 +1043,14 @@ void displayTask(void* pv) {
     oled.print(WiFi.status() == WL_CONNECTED ? "OK" : "--");
     oled.print(" M:");
     oled.print(mqttOk ? "OK" : "--");
+    oled.print(" S:");
+    // Schedule: A=ativo, O=override, -=ocioso (flag volatile lida sem mutex extra)
+    if (g_scheduleManualHold) oled.print("O");
+    else if (g_timeSynced && g_schedule.enabled) {
+      struct tm probe;
+      if (readLocalTime(probe) && isScheduleWindowActive(g_schedule, probe)) oled.print("A");
+      else oled.print("-");
+    } else oled.print("-");
 
     oled.display();
     vTaskDelay(pdMS_TO_TICKS(250));
@@ -771,7 +1061,7 @@ void displayTask(void* pv) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== Sistema de Segurança Patrimonial v3.2 ===");
+  Serial.println("\n=== Sistema de Segurança Patrimonial v3.3 (agendamento) ===");
 
   statusMutex = xSemaphoreCreateMutex();
   eventQueue  = xQueueCreate(16, sizeof(Event));
@@ -783,6 +1073,7 @@ void setup() {
   }
 
   nvsLoad();
+  nvsLoadSchedule();
   Serial.printf("[NVS] Estado restaurado: %d\n", (int)g_status.state);
 
   // LEDC configurado UMA vez no setup (fora das tasks)

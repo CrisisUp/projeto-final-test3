@@ -17,6 +17,7 @@ O firmware e a interface falam o mesmo contrato MQTT (mesmos tópicos e payloads
 - **Sensores em tempo real**: distância (ultrassônico), PIR (movimento) e LDR (luminosidade)
 - **Status do hardware**: presença online/offline do ESP32 (via Last Will and Testament)
 - **Controles**: armar, desarmar, silenciar alarme, testar sirene e recalibrar LDR
+- **Horário de armamento**: janela diária (ex.: 18:00–08:00) com opção “só dias úteis”; o ESP32 aplica sozinho via NTP
 - **Histórico de eventos**: log em tempo real no painel (limitado a 30 linhas visíveis)
 - **Feedback sonoro**: bipe curto no navegador quando chega um alarme
 
@@ -29,6 +30,7 @@ O firmware e a interface falam o mesmo contrato MQTT (mesmos tópicos e payloads
 - **Persistência NVS** do estado após reboot
 - **Auto-reset** do alarme após **60 segundos** (volta para ARMADO)
 - **Calibração de LDR** no boot e por comando MQTT
+- **Agendamento de armamento** (janela diária + NTP + NVS; override manual)
 - Arquitetura **FreeRTOS** em 5 tasks (2 núcleos)
 
 ---
@@ -76,6 +78,19 @@ Prefixo comum: `seguranca/patrimonio/meu-esp32`
 | `.../log` | ESP32 → web | `{"event":"armed","state":1,"ts":...}` | Eventos do firmware |
 | `.../sensors` | ESP32 → web | `{"pir":false,"dist":120,"ldr":800,"ldr_anomaly":false}` | Leituras dos sensores |
 | `.../status` | ESP32 → web | `online` \| `offline` | LWT (texto puro) |
+| `.../schedule` | web ⇄ ESP32 | `{"enabled":true,"armAt":"18:00","disarmAt":"08:00","weekdaysOnly":true}` | Config do agendamento; ESP32 publica **retained** |
+
+Payload de `.../state` (campo opcional `schedule`):
+
+```json
+{ "armed": true, "alarm": false, "schedule": "active" }
+```
+
+| Valor de `schedule` | Significado |
+|---------------------|-------------|
+| `idle` | Agendamento desligado ou fora da janela |
+| `active` | Dentro da janela de armamento |
+| `override` | Dentro da janela com hold manual (usuário desarmou) |
 
 ### Ações aceitas em `.../cmd`
 
@@ -100,6 +115,12 @@ Prefixo comum: `seguranca/patrimonio/meu-esp32`
 | `recalibrating` | Recalibração de LDR solicitada |
 | `recalibrated` | Recalibração concluída |
 | `test` | Teste de sirene |
+| `schedule_saved` | Agendamento validado e gravado no NVS |
+| `schedule_armed` | Janela começou → armou automaticamente |
+| `schedule_disarmed` | Janela terminou → desarmou automaticamente |
+| `schedule_skipped` | Início da janela com override manual (não rearmou) |
+| `schedule_invalid` | Payload/horário inválido em `.../schedule` |
+| `schedule_time_missing` | NTP ainda não sincronizado (não transiciona) |
 
 ---
 
@@ -163,6 +184,26 @@ Prefixo comum: `seguranca/patrimonio/meu-esp32`
 
 - O botão **Silenciar Alarme** só fica habilitado quando o estado recebido indica alarme ativo.
 - O **botão físico** no ESP32 alterna: desarmado → armado; armado/alarme → desarmado (e silencia a sirene).
+
+### Horário de armamento (agendamento)
+
+No painel, o card **Horário de Armamento** permite configurar a qualquer momento:
+
+| Campo | Exemplo | Observação |
+|-------|---------|------------|
+| Início | `18:00` | Minuto em que o sistema deve armar |
+| Fim | `08:00` | Janela pode **cruzar meia-noite** |
+| Só dias úteis | ☑ | Seg–sex (tm_wday 1–5) |
+| Agendamento ativo | ☑ | Se desmarcado, o ESP32 deixa de transicionar |
+
+Regras:
+
+1. O **ESP32 com NTP** é a autoridade: arma no início e desarma no fim da janela (funciona com o navegador fechado).
+2. **Override manual**: desarmar **dentro** da janela impede o rearme automático até o **fim** dessa janela.
+3. Armar manualmente limpa o hold; salvar uma nova configuração também religa o agendamento.
+4. Sem NTP (rede/servidor de tempo), o firmware publica `schedule_time_missing` e **não** transiciona.
+5. Fuso fixo no firmware: **UTC-3** (America/Sao_Paulo, sem DST). Ajuste `NTP_GMT_OFFSET_SEC` se necessário.
+6. Para testar rápido no Wokwi: salve uma janela de 2–3 minutos a partir do horário atual.
 
 ---
 
@@ -307,6 +348,9 @@ Fluxo recomendado de ponta a ponta:
 | 7 | Clicar **🔓 Desarmar** | Card **DESARMADO**; log `disarmed` |
 | 8 | Clicar **🌗 Recalibrar LDR** | Logs `recalibrating` → `recalibrated` |
 | 9 | Observar métricas a cada ~2 s | Distância percorre faixas (verde → âmbar → vermelho); PIR/LDR variam |
+| 10 | Salvar horário no card **Horário de Armamento** | Serial: `[SCHED] saved …` + log `schedule_saved`; painel mostra o resumo |
+| 11 | Janela de 2–3 min a partir de “agora” | Borda de início → `schedule_armed` + card ARMADO |
+| 12 | Desarmar no meio da janela | Hold ativo; não rearma sozinho até o fim da janela |
 
 Checklist de aceitação:
 
@@ -316,6 +360,9 @@ Checklist de aceitação:
 - [ ] Alarme dispara no painel (INVASÃO + bipe) quando armado
 - [ ] Silenciar / Desarmar recuperam o sistema
 - [ ] Botão físico do Wokwi também alterna o estado
+- [ ] Agendamento: salvar horário → ESP32 publica retained → painel reexibe
+- [ ] Agendamento: borda de janela arma/desarma sem o navegador
+- [ ] Override: desarmar na janela segura até o fim dela
 
 > **Importante:** o tópico padrão é `seguranca/patrimonio/meu-esp32`. No firmware, troque **apenas** `SECURITY_TOPIC_PREFIX` em `sketch.ino` e `firmware_teste.ino`; no web, o prefixo está em `app.js` (`MQTT_TOPIC_BASE`). Os valores devem ser idênticos.
 
@@ -356,7 +403,7 @@ projeto-final-test3/
 | `index.html` | Estrutura semântica, IDs do DOM, carga de CSS/JS |
 | `styles.css` | Aparência, estados visuais, responsivo |
 | `app.js` | Constantes, renderização, handlers MQTT, bootstrap |
-| `sketch.ino` | Sensores, sirene, OLED, máquina de estados, MQTT |
+| `sketch.ino` | Sensores, sirene, OLED, máquina de estados, MQTT, agendamento |
 | `platformio.ini` | Env `esp32dev` e `esp32dev_teste` (PlatformIO) |
 | `.wokwi.toml` / `diagram.toml` | Projeto Wokwi da **produção** (hardware completo) |
 | `firmware_teste/*` | Projeto Wokwi **leve** só para o painel (botão + LED) |
@@ -379,7 +426,7 @@ projeto-final-test3/
 | Markup / estilo / lógica web | HTML5, CSS3, JS ES6+ (sem framework) |
 | MQTT (browser) | MQTT.js via CDN (unpkg) — WebSocket 8884 |
 | MQTT (ESP32) | PubSubClient — TCP 1883 |
-| Firmware | Arduino ESP32, FreeRTOS, ArduinoJson, Preferences |
+| Firmware | Arduino ESP32, FreeRTOS, ArduinoJson, Preferences, **NTP** |
 | Build firmware | Arduino IDE **ou** PlatformIO (`platformio.ini`) |
 | Display | Adafruit SSD1306 (I2C) |
 | Broker | HiveMQ público (`broker.hivemq.com`) |
@@ -398,12 +445,13 @@ projeto-final-test3/
 7. **Dependência de CDN e rede** — sem internet ou com unpkg/broker fora do ar, o painel não conecta.
 8. **WiFi hardcoded** no firmware (`Wokwi-GUEST`) — ajuste para a sua rede.
 9. **`.vscode` incompatível com ESP32** — configs de gcc desktop; use Arduino IDE/PlatformIO para o sketch.
+10. **Agendamento depende de NTP e fuso fixo (UTC-3)** — sem relógio de rede, o ESP32 não arma/desarma sozinho; o hold manual não é persistido no NVS (reinício limpa o override).
 
 ---
 
-## Robustez do firmware (v3.2)
+## Robustez do firmware (v3.3)
 
-Correções aplicadas para operação estável com o painel:
+Correções e recursos para operação estável com o painel e o escritório:
 
 | Tema | Implementação |
 |------|----------------|
@@ -413,6 +461,7 @@ Correções aplicadas para operação estável com o painel:
 | PubSubClient multi-task | `displayTask` lê `g_mqttConnected` (flag volatile), sem tocar no client |
 | Sirene | Task independente; desligada em disarm/reset/timeout |
 | Clean Code (v3.2) | Funções em inglês (`calibrateLdr`, `validateLdrAnomaly`…); tópicos derivados de `SECURITY_TOPIC_PREFIX` |
+| Agendamento (v3.3) | `.../schedule` retained + NVS; bordas via NTP na `alarmTask`; override manual até o fim da janela |
 
 ---
 
@@ -429,9 +478,11 @@ Itens que elevariam o projeto para uso mais sério — **não implementados** ne
 - Testes automatizados dos handlers de mensagem
 - Migração ArduinoJson v6 → v7 (`JsonDocument`)
 - Diagrama de fiação físico (Fritzing) além do Wokwi
+- Múltiplas janelas de agendamento por dia / por dia da semana
+- Fuso configurável no painel (além do UTC-3 fixo no firmware)
 
 ---
 
 ## Licença e uso
 
-Projeto didático/profissional. Adapte tópicos, limiares, WiFi e broker conforme o seu hardware e o seu ambiente de rede. **Não** use broker público sem autenticação em cenários reais de proteção de patrimônio.
+Projeto didático/profissional. Adapte tópicos, limiares, WiFi, fuso NTP e broker conforme o seu hardware e o seu ambiente de rede. **Não** use broker público sem autenticação em cenários reais de proteção de patrimônio.

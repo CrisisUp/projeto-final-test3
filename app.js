@@ -29,6 +29,7 @@ const MQTT_TOPIC_ALARM   = `${MQTT_TOPIC_BASE}/alarm`;
 const MQTT_TOPIC_LOG     = `${MQTT_TOPIC_BASE}/log`;
 const MQTT_TOPIC_SENSORS = `${MQTT_TOPIC_BASE}/sensors`;
 const MQTT_TOPIC_STATUS  = `${MQTT_TOPIC_BASE}/status`;
+const MQTT_TOPIC_SCHEDULE = `${MQTT_TOPIC_BASE}/schedule`;
 
 // Reconexão e timeout evitam travar a UI se o broker cair.
 const MQTT_RECONNECT_MS = 3000;
@@ -55,6 +56,14 @@ const COMMAND_RESET_ALARM = 'reset_alarm';
 const COMMAND_TEST_SIREN = 'test';
 const COMMAND_RECALIBRATE = 'recalibrate';
 
+// Valores do campo opcional "schedule" no payload de estado (firmware).
+const SCHEDULE_STATE_IDLE = 'idle';
+const SCHEDULE_STATE_ACTIVE = 'active';
+const SCHEDULE_STATE_OVERRIDE = 'override';
+
+// HH:MM 24h — mesmo formato usado no firmware (parseHourMinute).
+const SCHEDULE_TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+
 /* =========================================================
    2. Referências ao DOM
    ========================================================= */
@@ -75,6 +84,13 @@ const buttonDisarm = document.getElementById('btnDisarm');
 const buttonReset = document.getElementById('btnReset');
 const buttonTest = document.getElementById('btnTest');
 const buttonRecalibrate = document.getElementById('btnRecal');
+
+const scheduleArmInput = document.getElementById('schedArmAt');
+const scheduleDisarmInput = document.getElementById('schedDisarmAt');
+const scheduleWeekdaysCheckbox = document.getElementById('schedWeekdaysOnly');
+const scheduleEnabledCheckbox = document.getElementById('schedEnabled');
+const scheduleSaveButton = document.getElementById('btnSaveSchedule');
+const scheduleStatusElement = document.getElementById('schedStatus');
 
 /* =========================================================
    3. Helpers puros
@@ -102,6 +118,7 @@ function formatTimestamp(timestamp) {
  * Classifica a mensagem de log para aplicar a cor correta no painel.
  * Ordem preservada do código original: "arm" casa antes de "disarm",
  * então mensagens que contenham "disarm" também entram na classe "arm".
+ * Eventos de agendamento seguem a mesma lógica (schedule_armed → arm).
  * @param {string} message
  * @returns {string} classe CSS do .log-line ('' | 'alarm' | 'arm' | 'disarm')
  */
@@ -110,6 +127,107 @@ function classifyLogMessage(message) {
   if (message.includes('arm')) return 'arm';
   if (message.includes('disarm')) return 'disarm';
   return '';
+}
+
+/**
+ * Valida um horário no formato HH:MM 24h (aceito pelo firmware).
+ * @param {string} value
+ * @returns {boolean}
+ */
+function isValidTimeString(value) {
+  return SCHEDULE_TIME_PATTERN.test(value);
+}
+
+/**
+ * Monta o payload JSON do tópico .../schedule.
+ * @param {{enabled: boolean, armAt: string, disarmAt: string, weekdaysOnly: boolean}} config
+ * @returns {object}
+ */
+function buildSchedulePayload(config) {
+  return {
+    enabled: config.enabled,
+    armAt: config.armAt,
+    disarmAt: config.disarmAt,
+    weekdaysOnly: config.weekdaysOnly,
+  };
+}
+
+/**
+ * Resume a configuração de agendamento em texto legível.
+ * @param {{enabled?: boolean, armAt?: string, disarmAt?: string, weekdaysOnly?: boolean}} config
+ * @returns {string}
+ */
+function formatScheduleSummary(config) {
+  const armAt = config.armAt || '--:--';
+  const disarmAt = config.disarmAt || '--:--';
+  const dayScope = config.weekdaysOnly ? 'só dias úteis' : 'todos os dias';
+  const active = config.enabled ? 'ativo' : 'inativo';
+  return `Armado ${armAt}–${disarmAt} · ${dayScope} · ${active}`;
+}
+
+/**
+ * Traduz o campo "schedule" do payload de estado em texto pt-BR.
+ * @param {string} scheduleField
+ * @returns {string}
+ */
+function describeScheduleField(scheduleField) {
+  if (scheduleField === SCHEDULE_STATE_ACTIVE) {
+    return 'janela ativa (dentro do horário)';
+  }
+  if (scheduleField === SCHEDULE_STATE_OVERRIDE) {
+    return 'override manual (desarmado no meio da janela)';
+  }
+  return 'ociosa (fora do horário ou desligada)';
+}
+
+/**
+ * Lê o formulário de agendamento do DOM.
+ * @returns {{enabled: boolean, armAt: string, disarmAt: string, weekdaysOnly: boolean}}
+ */
+function readScheduleForm() {
+  return {
+    enabled: scheduleEnabledCheckbox.checked,
+    armAt: scheduleArmInput.value,
+    disarmAt: scheduleDisarmInput.value,
+    weekdaysOnly: scheduleWeekdaysCheckbox.checked,
+  };
+}
+
+/**
+ * Preenche o formulário a partir de um payload recebido/retained.
+ * @param {{enabled?: boolean, armAt?: string, disarmAt?: string, weekdaysOnly?: boolean}} config
+ */
+function fillScheduleForm(config) {
+  if (typeof config.armAt === 'string' && isValidTimeString(config.armAt)) {
+    scheduleArmInput.value = config.armAt;
+  }
+  if (typeof config.disarmAt === 'string' && isValidTimeString(config.disarmAt)) {
+    scheduleDisarmInput.value = config.disarmAt;
+  }
+  if (typeof config.weekdaysOnly === 'boolean') {
+    scheduleWeekdaysCheckbox.checked = config.weekdaysOnly;
+  }
+  if (typeof config.enabled === 'boolean') {
+    scheduleEnabledCheckbox.checked = config.enabled;
+  }
+}
+
+/**
+ * Atualiza o status textual do card de agendamento.
+ * @param {{enabled?: boolean, armAt?: string, disarmAt?: string, weekdaysOnly?: boolean}} config
+ * @param {string} [scheduleField] campo opcional do tópico de estado
+ * @param {'ok'|'warn'|'error'|''} [tone]
+ */
+function renderScheduleStatus(config, scheduleField = '', tone = 'ok') {
+  const summary = formatScheduleSummary(config);
+  let text = summary;
+
+  if (scheduleField) {
+    text += ` · Status atual: ${describeScheduleField(scheduleField)}`;
+  }
+
+  scheduleStatusElement.textContent = text;
+  scheduleStatusElement.className = `schedule-status ${tone}`.trim();
 }
 
 /**
@@ -273,12 +391,40 @@ function publishCommand(action) {
 }
 
 /**
- * Handler do tópico de estado (armed / alarm).
+ * Publica a configuração de agendamento no tópico .../schedule.
+ * O ESP32 persiste em NVS e re-broadcasta o payload (retained).
+ * @param {{enabled: boolean, armAt: string, disarmAt: string, weekdaysOnly: boolean}} config
+ */
+function publishSchedule(config) {
+  if (!mqttClient || !mqttClient.connected) {
+    scheduleStatusElement.textContent =
+      'Sem conexão MQTT — horário não enviado.';
+    scheduleStatusElement.className = 'schedule-status warn';
+    return;
+  }
+
+  const payload = buildSchedulePayload(config);
+  mqttClient.publish(MQTT_TOPIC_SCHEDULE, JSON.stringify(payload), { qos: 0 });
+  renderScheduleStatus(payload, '', 'ok');
+  appendLogEntry(
+    `→ agendamento: ${payload.armAt}–${payload.disarmAt}${payload.enabled ? '' : ' (inativo)'}`,
+    'arm'
+  );
+}
+
+/**
+ * Handler do tópico de estado (armed / alarm / schedule).
  * @param {string} rawPayload
  */
 function handleStateMessage(rawPayload) {
   const data = JSON.parse(rawPayload);
   renderSystemState(data.armed, data.alarm);
+
+  // Complementa o card de agendamento se o firmware publicar o campo schedule.
+  if (typeof data.schedule === 'string') {
+    const form = readScheduleForm();
+    renderScheduleStatus(form, data.schedule, 'ok');
+  }
 }
 
 /**
@@ -326,6 +472,17 @@ function handleStatusMessage(rawPayload) {
 }
 
 /**
+ * Handler do tópico de agendamento (config retained do ESP32).
+ * Preenche o formulário e o status do card.
+ * @param {string} rawPayload
+ */
+function handleScheduleMessage(rawPayload) {
+  const data = JSON.parse(rawPayload);
+  fillScheduleForm(data);
+  renderScheduleStatus(data, '', 'ok');
+}
+
+/**
  * Roteia a mensagem MQTT para o handler correspondente ao tópico.
  * Erros de parse são engolidos para não derrubar o listener.
  * @param {string} topic
@@ -345,6 +502,8 @@ function routeMqttMessage(topic, payload) {
       handleSensorMessage(rawPayload);
     } else if (topic === MQTT_TOPIC_STATUS) {
       handleStatusMessage(rawPayload);
+    } else if (topic === MQTT_TOPIC_SCHEDULE) {
+      handleScheduleMessage(rawPayload);
     }
   } catch (error) {
     console.warn('Falha ao processar mensagem MQTT:', error);
@@ -352,7 +511,7 @@ function routeMqttMessage(topic, payload) {
 }
 
 /**
- * Assina os tópicos de telemetria e estado do sistema.
+ * Assina os tópicos de telemetria, estado e agendamento do sistema.
  */
 function subscribeToSystemTopics() {
   mqttClient.subscribe([
@@ -361,6 +520,7 @@ function subscribeToSystemTopics() {
     MQTT_TOPIC_LOG,
     MQTT_TOPIC_SENSORS,
     MQTT_TOPIC_STATUS,
+    MQTT_TOPIC_SCHEDULE,
   ]);
 }
 
@@ -418,11 +578,31 @@ function wireControlButtons() {
 }
 
 /**
+ * Liga o formulário de agendamento: valida e publica em .../schedule.
+ */
+function wireScheduleForm() {
+  scheduleSaveButton.addEventListener('click', () => {
+    const config = readScheduleForm();
+
+    if (!isValidTimeString(config.armAt) || !isValidTimeString(config.disarmAt)) {
+      renderScheduleStatus(config, '', 'error');
+      scheduleStatusElement.textContent =
+        'Horários inválidos — use o formato HH:MM (00:00–23:59).';
+      return;
+    }
+
+    publishSchedule(config);
+  });
+}
+
+/**
  * Inicializa o painel no estado padrão e estabelece a conexão MQTT.
  */
 function initializeDashboard() {
   renderSystemState(false, false);
   wireControlButtons();
+  wireScheduleForm();
+  renderScheduleStatus(readScheduleForm(), '', 'ok');
   connectMqttClient();
 }
 
